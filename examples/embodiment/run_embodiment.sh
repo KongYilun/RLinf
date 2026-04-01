@@ -8,7 +8,9 @@ export MUJOCO_GL="egl"
 export PYOPENGL_PLATFORM="egl"
 
 export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
+export LIBERO_REPO_PATH="/opt/libero"
 export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
+export PYTHONPATH=${REPO_PATH}:${LIBERO_REPO_PATH}:$PYTHONPATH
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
 # Only required when running the behavior experiment.
@@ -34,6 +36,13 @@ ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
 export ROBOT_PLATFORM
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
+export WANDB_ENTITY="kongyilun333"
+export WANDB_API_KEY=227446d2817003989abaf27aff2159a908b483e2
+# export WANDB_MODE="offline"
+
+export RAY_PDB=1
+export RAY_DEBUG=legacy
+
 echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
@@ -41,3 +50,4 @@ mkdir -p "${LOG_DIR}"
 CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+

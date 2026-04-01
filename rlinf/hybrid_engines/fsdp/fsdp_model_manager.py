@@ -36,7 +36,7 @@ from rlinf.hybrid_engines.fsdp.utils import (
     get_lr_scheduler,
 )
 from rlinf.utils.logging import get_logger
-from rlinf.utils.utils import warmup_optimizer_state
+from rlinf.utils.utils import clear_memory, warmup_optimizer_state
 
 warnings.filterwarnings(
     "ignore",
@@ -307,6 +307,17 @@ class FSDPModelManager:
             self.lr_scheduler,
             save_path,
         )
+
+        # Save forces full GPU residency and large temporary allocations; restore CPU
+        # offload when configured so the next step (e.g. SigLIP REINFORCE) and the
+        # following run_training() do not hit peak+fragmentation OOM.
+        if self._cfg.get("enable_offload", False):
+            if not self.is_weight_offloaded:
+                self.offload_param_and_grad()
+            if not self.is_optimizer_offloaded:
+                self.offload_optimizer()
+
+        clear_memory()
 
     def offload_param_and_grad(self, offload_grad: bool = False) -> None:
         """

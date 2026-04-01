@@ -1251,6 +1251,16 @@ class ChunkStepResult:
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    z_ids: torch.Tensor = None
+    task_ids: torch.Tensor = None
+    # Optional: one row per env, filled on the first chunk of each rollout epoch when RL
+    # condition policy is enabled (see EmbodiedRolloutResult).
+    cond_log_prob_cluster: Optional[torch.Tensor] = None
+    cond_log_prob_residual: Optional[torch.Tensor] = None
+    cond_log_prob_joint: Optional[torch.Tensor] = None
+    cond_residual: Optional[torch.Tensor] = None
+    cond_initial_image_hwc: Optional[torch.Tensor] = None  # [B, H, W, 3] uint8
+    cond_pred_cluster_idx: Optional[torch.Tensor] = None  # [B] long
 
     def __post_init__(self):
         if self.prev_logprobs is not None:
@@ -1267,6 +1277,22 @@ class ChunkStepResult:
             self.rewards = self.rewards.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        if self.z_ids is not None:
+            self.z_ids = self.z_ids.cpu().contiguous()
+        if self.task_ids is not None:
+            self.task_ids = self.task_ids.cpu().contiguous()
+        if self.cond_log_prob_cluster is not None:
+            self.cond_log_prob_cluster = self.cond_log_prob_cluster.cpu().contiguous()
+        if self.cond_log_prob_residual is not None:
+            self.cond_log_prob_residual = self.cond_log_prob_residual.cpu().contiguous()
+        if self.cond_log_prob_joint is not None:
+            self.cond_log_prob_joint = self.cond_log_prob_joint.cpu().contiguous()
+        if self.cond_residual is not None:
+            self.cond_residual = self.cond_residual.cpu().contiguous()
+        if self.cond_initial_image_hwc is not None:
+            self.cond_initial_image_hwc = self.cond_initial_image_hwc.cpu().contiguous()
+        if self.cond_pred_cluster_idx is not None:
+            self.cond_pred_cluster_idx = self.cond_pred_cluster_idx.cpu().contiguous()
 
 
 @dataclass(kw_only=True)
@@ -1297,6 +1323,19 @@ class EmbodiedRolloutResult:
     transitions: list[tuple[dict[str, Any], dict[str, Any]]] = field(
         default_factory=list
     )
+    z_ids: list[torch.Tensor] = field(
+        default_factory=list
+    )
+    task_ids: list[torch.Tensor] = field(
+        default_factory=list
+    )
+    cond_log_prob_cluster: list[torch.Tensor] = field(default_factory=list)
+    cond_log_prob_residual: list[torch.Tensor] = field(default_factory=list)
+    cond_log_prob_joint: list[torch.Tensor] = field(default_factory=list)
+    cond_residual: list[torch.Tensor] = field(default_factory=list)
+    cond_initial_image_hwc: list[torch.Tensor] = field(default_factory=list)
+    cond_task_ids: list[torch.Tensor] = field(default_factory=list)
+    cond_pred_cluster_idx: list[torch.Tensor] = field(default_factory=list)
 
     def append_result(self, result: ChunkStepResult):
         if result.prev_logprobs is not None:
@@ -1313,6 +1352,18 @@ class EmbodiedRolloutResult:
             self.rewards.append(result.rewards)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        if result.z_ids is not None:
+            self.z_ids.append(result.z_ids)
+        if result.task_ids is not None:
+            self.task_ids.append(result.task_ids)
+        if result.cond_log_prob_cluster is not None:
+            self.cond_log_prob_cluster.append(result.cond_log_prob_cluster)
+            self.cond_log_prob_residual.append(result.cond_log_prob_residual)
+            self.cond_log_prob_joint.append(result.cond_log_prob_joint)
+            self.cond_residual.append(result.cond_residual)
+            self.cond_initial_image_hwc.append(result.cond_initial_image_hwc)
+            self.cond_task_ids.append(result.task_ids)
+            self.cond_pred_cluster_idx.append(result.cond_pred_cluster_idx)
 
     def add_transition(self, obs, next_obs):
         self.transitions.append(
@@ -1354,6 +1405,54 @@ class EmbodiedRolloutResult:
             if len(self.rewards) > 0
             else None
         )
+        rollout_result_dict["z_ids"] = (
+            torch.stack(self.z_ids, dim=0).cpu().contiguous()
+            if len(self.z_ids) > 0
+            else None
+        )
+        rollout_result_dict["task_ids"] = (
+            torch.stack(self.task_ids, dim=0).cpu().contiguous()
+            if len(self.task_ids) > 0
+            else None
+        )
+
+        if len(self.cond_log_prob_cluster) > 0:
+            n_ep = self.rollout_epoch
+            n_chunks_total = len(self.prev_logprobs)
+            assert n_ep > 0 and n_chunks_total % n_ep == 0, (
+                f"cond policy: bad chunk count {n_chunks_total=} vs {n_ep=}"
+            )
+            n_chunk = n_chunks_total // n_ep
+
+            def _expand_along_chunks(stacked: torch.Tensor) -> torch.Tensor:
+                # stacked: [n_ep, B, ...]
+                return (
+                    stacked.unsqueeze(1)
+                    .expand(-1, n_chunk, *([-1] * (stacked.ndim - 1)))
+                    .reshape(n_ep * n_chunk, *stacked.shape[1:])
+                )
+
+            rollout_result_dict["cond_log_prob_cluster"] = _expand_along_chunks(
+                torch.stack(self.cond_log_prob_cluster, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_log_prob_residual"] = _expand_along_chunks(
+                torch.stack(self.cond_log_prob_residual, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_log_prob_joint"] = _expand_along_chunks(
+                torch.stack(self.cond_log_prob_joint, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_residual"] = _expand_along_chunks(
+                torch.stack(self.cond_residual, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_initial_image_hwc"] = _expand_along_chunks(
+                torch.stack(self.cond_initial_image_hwc, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_task_ids"] = _expand_along_chunks(
+                torch.stack(self.cond_task_ids, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_pred_cluster_idx"] = _expand_along_chunks(
+                torch.stack(self.cond_pred_cluster_idx, dim=0).cpu().contiguous()
+            )
 
         merged_forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
         for k in merged_forward_inputs.keys():

@@ -18,3 +18,12 @@ outputs/*
 .docs-venv
 uv.lock
 rlinf/envs/maniskill/assets
+step1_embedding/per_instr_cluster_videos
+step1_embedding/*.pt
+step1_embedding/**/*.pt
+step2_warmup/*.pt
+step2_warmup/**/*.pt
+step3_encoder_training/*.pt
+step3_encoder_training/**/*.pt
+*.pt
+dataset

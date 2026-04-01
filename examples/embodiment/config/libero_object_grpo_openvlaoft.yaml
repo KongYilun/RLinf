@@ -22,10 +22,10 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_grpo_openvlaoft"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    experiment_name: "libero_object_z_generator_sto_512"
+    logger_backends: ["wandb"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 200
   max_steps: -1
 
   only_eval: False
@@ -36,10 +36,33 @@ runner:
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
+  use_optimizable_embedding: True
+  # SigLIP 条件模型 rollout 时从 logits_c softmax 采样聚类；温度见 condition_model_sto.forward
+  siglip_cluster_sample_temperature: 2.0
+
+  # REINFORCE on SigLIP condition policy (requires use_optimizable_embedding=True).
+  # When enable_rl is false, behavior matches pre–condition-policy-RL runs.
+  condition_policy:
+    enable_rl: False
+    checkpoint_path: null # default: step3_encoder_training/siglip_condition_model_sto.pt
+    cluster_sample_temperature: 2.0 # falls back to siglip_cluster_sample_temperature if omitted
+    deterministic_cluster_train: false
+    deterministic_residual_train: false
+    deterministic_cluster_eval: true
+    deterministic_residual_eval: true
+    reinforce_logprob: joint # joint | cluster
+    baseline_momentum: 0.95
+    residual_l2_coef: 0.5
+    update_interval_vla_steps: 5
+    lr: 1.0e-5
+    weight_decay: 0.01
+    grad_clip: null
+    micro_batch_size: 32
+
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 8
-  rollout_epoch: 16
+  rollout_epoch: 8
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: action_level  # action_level or chunk_level
@@ -113,22 +136,23 @@ rollout:
   generation_backend: "huggingface"
   enable_offload: True
   pipeline_stage_num: 1
+  
 
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-object-traj1/"
+    model_path: "/data/users/kongyilun/code/RLinf/step2_warmup/openvla-oft-conditioned/runs/libero_condition_z_10--30000_chkpt"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 32
-  global_batch_size: 16384
+  global_batch_size: 8192
   seed: 1234
   enable_offload: True
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-object-traj1/"
+    model_path: "/data/users/kongyilun/code/RLinf/step2_warmup/openvla-oft-conditioned/runs/libero_condition_z_10--30000_chkpt"
     model_type: "openvla_oft"
     unnorm_key: libero_object_no_noops
     max_prompt_length: 128

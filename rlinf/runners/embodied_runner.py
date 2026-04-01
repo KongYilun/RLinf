@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
+import shutil
 from typing import TYPE_CHECKING, Optional, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -38,6 +40,8 @@ if TYPE_CHECKING:
         AsyncMultiStepRolloutWorker,
     )
     from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+logger = logging.getLogger(__name__)
 
 
 class EmbodiedRunner:
@@ -82,6 +86,7 @@ class EmbodiedRunner:
         self.timer = ScopedTimer(reduction="max", sync_cuda=False)
 
         self.metric_logger = MetricLogger(cfg)
+        self._last_saved_step: Optional[int] = None
 
     def init_workers(self):
         # create worker in order to decrease the maximum memory usage
@@ -99,6 +104,8 @@ class EmbodiedRunner:
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
         self.global_step = int(resume_dir.split("global_step_")[-1])
+        self._last_saved_step = self.global_step
+        self.actor.load_condition_policy_pt(resume_dir, self.global_step).wait()
 
     def send_demo_buffer(self):
         if self.demo_buffer is not None:
@@ -190,8 +197,13 @@ class EmbodiedRunner:
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                         self.metric_logger.log(data=eval_metrics, step=_step)
 
+                # Save VLA + condition_policy.pt after GRPO CM updates inside run_training
+                # and before SigLIP REINFORCE (cluster-only) in train_condition_policy_if_due.
                 if save_model:
                     self._save_checkpoint()
+
+                with self.timer("condition_policy_training"):
+                    cond_policy_metrics = self.actor.train_condition_policy_if_due().wait()
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
@@ -206,9 +218,9 @@ class EmbodiedRunner:
                 f"rollout/{k}": v for k, v in actor_rollout_metrics[0].items()
             }
 
-            training_metrics = {
-                f"train/{k}": v for k, v in actor_training_metrics[0].items()
-            }
+            train_dict = dict(actor_training_metrics[0])
+            train_dict.update(cond_policy_metrics[0] or {})
+            training_metrics = {f"train/{k}": v for k, v in train_dict.items()}
 
             self.metric_logger.log(env_metrics, _step)
             self.metric_logger.log(rollout_metrics, _step)
@@ -235,6 +247,29 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        cp_cfg = self.cfg.algorithm.get("condition_policy") or {}
+        if cp_cfg.get("enable_rl", False):
+            self.actor.save_condition_policy_pt(base_output_dir).wait()
+
+        if self.cfg.runner.get("prune_previous_actor_dcp", False):
+            prev = self._last_saved_step
+            if prev is not None and prev != self.global_step:
+                checkpoints_root = os.path.join(
+                    self.cfg.runner.logger.log_path,
+                    self.cfg.runner.logger.experiment_name,
+                    "checkpoints",
+                )
+                prev_dcp = os.path.join(
+                    checkpoints_root,
+                    f"global_step_{prev}",
+                    "actor",
+                    "dcp_checkpoint",
+                )
+                if os.path.isdir(prev_dcp):
+                    shutil.rmtree(prev_dcp)
+                    logger.info("Removed previous actor DCP: %s", prev_dcp)
+
+        self._last_saved_step = self.global_step
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

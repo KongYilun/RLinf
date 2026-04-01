@@ -102,14 +102,6 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             train_step += 1
             self.update_rollout_weights()
 
-            training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
-            self.metric_logger.log(training_metrics, train_step)
-
-            env_metrics = self.get_env_metrics()
-            if env_metrics is not None:
-                rollout_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
-                self.metric_logger.log(rollout_metrics, train_step)
-
             _, save_model, _ = check_progress(
                 self.global_step,
                 self.max_steps,
@@ -121,9 +113,21 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             if save_model:
                 self._save_checkpoint()
 
+            cond_policy_metrics = self.actor.train_condition_policy_if_due().wait()
+            train_dict = dict(actor_result[0])
+            train_dict.update(cond_policy_metrics[0] or {})
+            training_metrics = {f"train/{k}": v for k, v in train_dict.items()}
+            self.metric_logger.log(training_metrics, train_step)
+
+            env_metrics = self.get_env_metrics()
+            if env_metrics is not None:
+                rollout_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+                self.metric_logger.log(rollout_metrics, train_step)
+
         self.env.stop().wait()
         self.rollout.stop().wait()
         env_handle.wait()
         rollout_handle.wait()
 
         self._save_checkpoint()
+        self.actor.train_condition_policy_if_due().wait()

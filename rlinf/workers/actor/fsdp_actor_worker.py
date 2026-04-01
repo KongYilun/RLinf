@@ -17,6 +17,7 @@ from functools import partial
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -65,6 +66,7 @@ from rlinf.utils.utils import (
     retrieve_model_state_dict_in_cpu,
 )
 from rlinf.workers.rollout.utils import RankMapper
+from step3_encoder_training.condition_model_sto_new import SiglipConditionRLModel
 
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
@@ -739,6 +741,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.enable_offload = self.cfg.actor.get("enable_offload", False)
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
 
+        self.condition_policy_cfg = self.cfg.algorithm.get("condition_policy") or {}
+        self.condition_policy_enable_rl = bool(
+            self.condition_policy_cfg.get("enable_rl", False)
+        )
+        # SigLIP REINFORCE scheduling; always defined so run_training can stay simple.
+        # Incremented only when condition_policy_enable_rl (see run_training).
+        self._vla_step_counter = 0
+        # Set each iteration before run_training (runner global_step).
+        self._runner_global_step = 0
+
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
         Setup destination ranks for weight communication.
@@ -768,6 +780,66 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
         self._setup_rollout_weight_dst_ranks()
+        if self.condition_policy_enable_rl:
+            self._init_condition_policy()
+
+    def _init_condition_policy(self) -> None:
+        device_str = f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}"
+        ckpt_path = self.condition_policy_cfg.get(
+            "checkpoint_path", None
+        ) or "step3_encoder_training/siglip_condition_model_sto_0.pt"
+        ckpt = torch.load(ckpt_path, map_location=device_str)
+        num_classes: int = ckpt["num_classes"]
+        residual_dim: int = ckpt["residual_dim"]
+        siglip_model_path: str = ckpt["siglip_model_path"]
+        center_embed_dim: int = int(ckpt.get("center_embed_dim", 512))
+
+        model = SiglipConditionRLModel(
+            model_path=siglip_model_path,
+            num_classes=num_classes,
+            residual_dim=residual_dim,
+            center_embed_dim=center_embed_dim,
+        )
+        state_dict = ckpt.get("model_state_dict", ckpt)
+        model.load_state_dict(state_dict, strict=False)
+        device = torch.device(device_str)
+        model.to(device)
+        # if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        #     model.to(dtype=torch.bfloat16)
+        model.train()
+
+        reinforce_lr = float(self.condition_policy_cfg.get("lr", 1e-5))
+        reinforce_wd = float(self.condition_policy_cfg.get("weight_decay", 0.01))
+        grpo_lr = float(self.condition_policy_cfg.get("grpo_cm_lr", 1e-4))
+        grpo_wd = float(self.condition_policy_cfg.get("grpo_cm_weight_decay", 0.01))
+        self._siglip_reinforce_trainable_params = list(model.siglip.parameters()) + list(
+            model.classifier_head.parameters()
+        )
+        self._siglip_grpo_trainable_params = list(model.cluster_embed.parameters()) + list(
+            model.residual_head.parameters()
+        )
+        self.siglip_condition_reinforce_optimizer = torch.optim.AdamW(
+            self._siglip_reinforce_trainable_params,
+            lr=reinforce_lr,
+            weight_decay=reinforce_wd,
+        )
+        self.siglip_condition_grpo_optimizer = torch.optim.AdamW(
+            self._siglip_grpo_trainable_params,
+            lr=grpo_lr,
+            weight_decay=grpo_wd,
+        )
+        self.siglip_condition_model = model
+        self._cond_baseline = torch.zeros(1, device=device)
+        self._cond_policy_buffer: dict[str, list[torch.Tensor]] = {
+            "task_ids": [],
+            "residual": [],
+            "reward": [],
+            "images": [],
+            "pred_cluster_idx": [],
+        }
+
+        instr_map = torch.load("libero_object_instruction_to_task_id_map.pt")
+        self._task_id_to_instruction = {int(v): k for k, v in instr_map.items()}
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -800,6 +872,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
+
+        if self.condition_policy_enable_rl:
+            cp_sd = {
+                k: v.detach().cpu()
+                for k, v in self.siglip_condition_model.state_dict().items()
+            }
+            for rank in self._weight_dst_rank_in_rollout:
+                self.send(cp_sd, self._rollout_group_name, rank, async_op=True)
 
     def recv_rollout_batch(self, input_channel: Channel) -> None:
         """
@@ -926,7 +1006,268 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        self._attach_cond_group_reward_for_condition_policy()
         return rollout_metrics
+
+    def _attach_cond_group_reward_for_condition_policy(self) -> None:
+        if not self.condition_policy_enable_rl:
+            return
+        rb = self.rollout_batch
+        if "cond_log_prob_cluster" not in rb or "rewards" not in rb:
+            return
+        rewards = rb["rewards"]
+        # from ray.util import pdb; pdb.set_trace()
+        gs = self.cfg.algorithm.group_size
+        s0, rb_sz = rewards.shape[0], rewards.shape[1]
+        per_env = rewards.sum(dim=(0, 2))
+        n_prompts = rb_sz // gs
+        rmat = per_env.reshape(n_prompts, gs)
+        rz = rmat.mean(dim=1)
+        cond_r = rz.repeat_interleave(gs)
+        rb["cond_group_reward"] = cond_r.unsqueeze(0).expand(s0, -1).contiguous()
+
+    def _snapshot_condition_policy_buffer(self) -> None:
+        if not self.condition_policy_enable_rl:
+            return
+        rb = self.rollout_batch
+        need = (
+            "cond_residual",
+            "cond_initial_image_hwc",
+            "cond_task_ids",
+            "cond_group_reward",
+            "cond_pred_cluster_idx",
+        )
+        if not all(k in rb for k in need):
+            return
+        gs = self.cfg.algorithm.group_size
+        # from ray.util import pdb; pdb.set_trace()
+        _, rb_sz = rb["cond_log_prob_cluster"].shape[:2]
+        idx = torch.arange(0, rb_sz, gs, device=rb["cond_task_ids"].device)
+
+        self._cond_policy_buffer["task_ids"].append(
+            rb["cond_task_ids"][0, idx].detach().cpu().clone()
+        )
+        self._cond_policy_buffer["residual"].append(
+            rb["cond_residual"][0, idx].detach().cpu().clone()
+        )
+        self._cond_policy_buffer["reward"].append(
+            rb["cond_group_reward"][0, idx].detach().cpu().clone()
+        )
+        self._cond_policy_buffer["images"].append(
+            rb["cond_initial_image_hwc"][0, idx].detach().cpu().clone()
+        )
+        self._cond_policy_buffer["pred_cluster_idx"].append(
+            rb["cond_pred_cluster_idx"][0, idx].detach().cpu().clone()
+        )
+
+    def _cm_grpo_training_enabled(self) -> bool:
+        if not self.condition_policy_enable_rl:
+            return False
+        if not self.cfg.algorithm.get("use_optimizable_embedding", False):
+            return False
+        start = int(self.condition_policy_cfg.get("grpo_cm_start_step", 0))
+        end = self.condition_policy_cfg.get("grpo_cm_end_step", None)
+        g = int(getattr(self, "_runner_global_step", 0))
+        if g < start:
+            return False
+        if end is not None and int(end) >= 0 and g > int(end):
+            return False
+        return True
+
+    def _micro_batch_has_cm_grpo_inputs(self, data: dict) -> bool:
+        if "z_ids" not in data or data["z_ids"] is None:
+            return False
+        if data["z_ids"].dim() != 2:
+            return False
+        if "cond_initial_image_hwc" not in data:
+            return False
+        if "cond_pred_cluster_idx" not in data:
+            return False
+        return True
+
+    def _build_grpo_z_for_microbatch(self, data: dict) -> torch.Tensor:
+        mb = int(data["prev_logprobs"].shape[0])
+        imgs = data["cond_initial_image_hwc"]
+        pidx = data["cond_pred_cluster_idx"].to(dtype=torch.long).view(-1)[:mb]
+        tid = data.get("cond_task_ids", data["task_ids"]).view(-1)[:mb]
+        images_list = [imgs[i].detach().cpu().numpy() for i in range(mb)]
+        instructions = [
+            self._task_id_to_instruction[int(tid[i].item())] for i in range(mb)
+        ]
+        return self.siglip_condition_model.forward_z_for_actor_grpo(
+            images_list, instructions, pidx
+        )
+
+    def _should_step_siglip_grpo_optimizer(self) -> bool:
+        if not self.condition_policy_enable_rl:
+            return False
+        if not getattr(self, "_cm_grpo_enabled_this_train", False):
+            return False
+        for p in self._siglip_grpo_trainable_params:
+            if p.grad is not None:
+                return True
+        return False
+
+    def optimizer_step(self) -> tuple[float, list[float]]:
+        self.optimizer_steps += 1
+        self.grad_scaler.unscale_(optimizer=self.optimizer)
+        grad_norm = self._strategy.clip_grad_norm_(model=self.model)
+
+        main_finite = torch.isfinite(torch.as_tensor(grad_norm))
+        if not main_finite:
+            self._logger.warning(
+                f"[FSDP] Non-finite grad norm {grad_norm} detected. Skipping optimizer step."
+            )
+        else:
+            self.grad_scaler.step(optimizer=self.optimizer)
+
+        if main_finite and self._should_step_siglip_grpo_optimizer():
+            self.grad_scaler.unscale_(optimizer=self.siglip_condition_grpo_optimizer)
+            gclip = self.condition_policy_cfg.get("grpo_cm_grad_clip", None)
+            max_norm = float(gclip) if gclip is not None else float("inf")
+            cm_gn = torch.nn.utils.clip_grad_norm_(
+                self._siglip_grpo_trainable_params, max_norm
+            )
+            if torch.isfinite(torch.as_tensor(cm_gn)):
+                self.grad_scaler.step(optimizer=self.siglip_condition_grpo_optimizer)
+
+        self.grad_scaler.update()
+
+        if self.critic_warmup_steps > 0:
+            lr_list = [0.0 for _ in self.optimizer.param_groups]
+            if self.optimizer_steps >= self.critic_warmup_steps:
+                self.optimizer = self.build_optimizer(model=self.model)
+                self.critic_warmup_steps = 0
+        else:
+            lr_list = [group["lr"] for group in self.optimizer.param_groups]
+
+        return grad_norm, lr_list
+
+    def _train_condition_policy_if_due(self) -> dict[str, float]:
+        if not self.condition_policy_enable_rl:
+            return {}
+        interval = int(self.condition_policy_cfg.get("update_interval_vla_steps", 5))
+        if self._vla_step_counter == 0 or self._vla_step_counter % interval != 0:
+            return {}
+        buf = self._cond_policy_buffer
+        if len(buf["task_ids"]) == 0:
+            return {}
+        task_ids = torch.cat(buf["task_ids"], dim=0)
+        residual = torch.cat(buf["residual"], dim=0)
+        rewards = torch.cat(buf["reward"], dim=0)
+        images_u8 = torch.cat(buf["images"], dim=0)
+        pred_cluster_idx_all = torch.cat(buf["pred_cluster_idx"], dim=0)
+        for k in buf:
+            buf[k].clear()
+
+        device = next(self.siglip_condition_model.parameters()).device
+        temp = float(
+            self.condition_policy_cfg.get(
+                "cluster_sample_temperature",
+                self.cfg.algorithm.get("siglip_cluster_sample_temperature", 1.0),
+            )
+        )
+        mom = float(self.condition_policy_cfg.get("baseline_momentum", 0.95))
+
+        n = int(task_ids.shape[0])
+        if n == 0:
+            return {}
+
+        rewards_dev = rewards.to(device=device, dtype=torch.float32)
+
+        self.siglip_condition_model.train()
+        self.siglip_condition_reinforce_optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            # NCCL all_reduce requires GPU tensors; rewards from buffer are CPU.
+            r_mean = rewards_dev.mean()
+            if dist.is_initialized() and self._world_size > 1:
+                rm = r_mean.clone()
+                dist.all_reduce(rm, op=dist.ReduceOp.AVG)
+                r_mean = rm
+            self._cond_baseline.mul_(mom).add_((1.0 - mom) * r_mean)
+        adv = (rewards_dev - self._cond_baseline).detach()
+
+        images_list = [images_u8[i].numpy() for i in range(n)]
+        instructions = [
+            self._task_id_to_instruction[int(task_ids[i].item())] for i in range(n)
+        ]
+        pred_cluster_stored = pred_cluster_idx_all.to(device=device, dtype=torch.long)
+        residual_sample = residual.to(device=device, dtype=torch.float32)
+
+        micro_bs = min(int(self.condition_policy_cfg.get("micro_batch_size", 32)), n)
+        total_pg = torch.zeros(1, device=device)
+        total_lp = torch.zeros(1, device=device)
+        n_mb = 0
+
+        for start in range(0, n, micro_bs):
+            end = min(start + micro_bs, n)
+            mb_img = images_list[start:end]
+            mb_instr = instructions[start:end]
+            mb_idx = pred_cluster_stored[start:end]
+            mb_res = residual_sample[start:end]
+            mb_adv = adv[start:end]
+
+            with torch.autocast(
+                device_type="cuda",
+                enabled=device.type == "cuda",
+                dtype=torch.bfloat16,
+            ):
+                out_lp = self.siglip_condition_model.evaluate_log_prob(
+                    images=mb_img,
+                    instructions=mb_instr,
+                    pred_cluster_idx=mb_idx,
+                    residual_sample=mb_res,
+                    cluster_sample_temperature=temp,
+                    reinforce_logprob="cluster",
+                )
+                logp = out_lp["log_prob_cluster"]
+                pg = -(mb_adv * logp).mean()
+                loss_mb = pg
+
+            loss_mb.backward()
+            total_pg += pg.detach()
+            total_lp += logp.detach().mean()
+            n_mb += 1
+
+        if dist.is_initialized() and self._world_size > 1:
+            for p in self._siglip_reinforce_trainable_params:
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+        grad_clip = self.condition_policy_cfg.get("grad_clip", None)
+        if grad_clip is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self._siglip_reinforce_trainable_params, float(grad_clip)
+            )
+
+        self.siglip_condition_reinforce_optimizer.step()
+
+        denom = max(n_mb, 1)
+        metrics = {
+            "cond/policy_loss": float((total_pg / denom).item()),
+            "cond/log_prob_cluster_mean": float((total_lp / denom).item()),
+            "cond/reward_mean": float(rewards.mean().item()),
+            "cond/baseline": float(self._cond_baseline.item()),
+        }
+        if dist.is_initialized() and self._world_size > 1:
+            t = torch.tensor(
+                [
+                    metrics["cond/policy_loss"],
+                    metrics["cond/log_prob_cluster_mean"],
+                    metrics["cond/reward_mean"],
+                    metrics["cond/baseline"],
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+            metrics = {
+                "cond/policy_loss": t[0].item(),
+                "cond/log_prob_cluster_mean": t[1].item(),
+                "cond/reward_mean": t[2].item(),
+                "cond/baseline": t[3].item(),
+            }
+        return metrics
 
     def run_training(self) -> None:
         """
@@ -938,6 +1279,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_optimizer(self.device)
 
         self.model.train()
+        self._cm_grpo_enabled_this_train = False
+        if self.condition_policy_enable_rl and getattr(
+            self, "siglip_condition_model", None
+        ) is not None:
+            self._cm_grpo_enabled_this_train = self._cm_grpo_training_enabled()
+            if self._cm_grpo_enabled_this_train:
+                self.siglip_condition_model.train()
+        self._snapshot_condition_policy_buffer()
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
@@ -995,6 +1344,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 )
 
                 self.optimizer.zero_grad()
+                if self.condition_policy_enable_rl and getattr(
+                    self, "_cm_grpo_enabled_this_train", False
+                ):
+                    self.siglip_condition_grpo_optimizer.zero_grad(set_to_none=True)
                 for idx, data in enumerate(train_micro_batch):
                     data = put_tensor_device(
                         data, f"cuda:{int(os.environ['LOCAL_RANK'])}"
@@ -1010,14 +1363,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     loss_mask = data.get("loss_mask", None)
                     loss_mask_sum = data.get("loss_mask_sum", None)
 
+                    z_grpo = None
+                    data_for_model = data
+                    _cm_grpo_this_mb = (
+                        self.condition_policy_enable_rl
+                        and getattr(self, "_cm_grpo_enabled_this_train", False)
+                        and self._micro_batch_has_cm_grpo_inputs(data)
+                        and SupportedModel(self.cfg.actor.model.model_type)
+                        in (SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT)
+                    )
+                    if _cm_grpo_this_mb:
+                        z_grpo = self._build_grpo_z_for_microbatch(data)
+                        data_for_model = {**data, "z_ids": z_grpo}
+
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
                         SupportedModel.OPENVLA_OFT,
                     ]:
-                        data["temperature"] = (
+                        data_for_model["temperature"] = (
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
-                        data["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        data_for_model["top_k"] = self.cfg.algorithm.sampling_params.top_k
 
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
@@ -1025,7 +1391,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                     with self.amp_context:
                         output_dict = self.model(
-                            data=data,
+                            data=data_for_model,
                             compute_logprobs=True,
                             compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
                             compute_values=compute_values,
@@ -1061,6 +1427,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     }
                     loss, metrics_data = policy_loss(**kwargs)
 
+                    grpo_l2_coef = float(
+                        self.condition_policy_cfg.get("grpo_residual_l2_coef", 0.5)
+                    )
+                    l2_cm_for_bwd = None
+                    if z_grpo is not None and grpo_l2_coef > 0:
+                        l2_cm_for_bwd = z_grpo.float().pow(2).sum(dim=-1).mean()
+                        metrics_data["cond/grpo_residual_l2"] = (
+                            l2_cm_for_bwd.detach().item()
+                        )
+
                     entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
                     if (
                         self.cfg.algorithm.entropy_bonus > 0
@@ -1078,8 +1454,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     metrics_data["entropy_loss"] = entropy_loss.detach().item()
 
                     loss /= self.gradient_accumulation
+                    retain_for_l2 = l2_cm_for_bwd is not None
                     with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
+                        self.grad_scaler.scale(loss).backward(
+                            retain_graph=retain_for_l2
+                        )
+                        if retain_for_l2:
+                            l2_term = (
+                                grpo_l2_coef
+                                * l2_cm_for_bwd
+                                / self.gradient_accumulation
+                            )
+                            self.grad_scaler.scale(l2_term).backward()
+
+                    if (
+                        dist.is_initialized()
+                        and self._world_size > 1
+                        and getattr(self, "_cm_grpo_enabled_this_train", False)
+                    ):
+                        for p in self._siglip_grpo_trainable_params:
+                            if p.grad is not None:
+                                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
                     metrics_data["loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)
@@ -1103,11 +1498,75 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
 
+        if self.condition_policy_enable_rl:
+            self._vla_step_counter += 1
+
         return mean_metric_dict
+
+    def train_condition_policy_if_due(self) -> dict[str, float]:
+        """
+        REINFORCE on ``log_prob_cluster`` for ``siglip`` + ``classifier_head`` (if interval).
+
+        Call from the runner **after** ``_save_checkpoint``. The saved
+        ``condition_policy.pt`` reflects state **after** GRPO updates inside
+        ``run_training`` and **before** this REINFORCE step.
+        """
+        if not self.condition_policy_enable_rl:
+            return {}
+        return self._train_condition_policy_if_due()
+
+    def save_condition_policy_pt(self, checkpoint_dir: str) -> None:
+        if not self.condition_policy_enable_rl or self._rank != 0:
+            return
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, "condition_policy.pt")
+        payload = {
+            "model": self.siglip_condition_model.state_dict(),
+            "reinforce_optimizer": self.siglip_condition_reinforce_optimizer.state_dict(),
+            "grpo_optimizer": self.siglip_condition_grpo_optimizer.state_dict(),
+            "baseline": self._cond_baseline.detach().cpu(),
+            "vla_step_counter": self._vla_step_counter,
+        }
+        torch.save(payload, path)
+
+    def load_condition_policy_pt(self, checkpoint_dir: str, global_step: int) -> None:
+        if not self.condition_policy_enable_rl:
+            return
+        path = os.path.join(checkpoint_dir, "condition_policy.pt")
+        if not os.path.isfile(path):
+            interval = int(self.condition_policy_cfg.get("update_interval_vla_steps", 5))
+            gs = int(global_step)
+            tag = max(0, ((gs - 1) // interval) * interval) if gs > 0 else 0
+            legacy_tagged = os.path.join(
+                checkpoint_dir, f"condition_policy_vla_step_{tag}.pt"
+            )
+            if os.path.isfile(legacy_tagged):
+                path = legacy_tagged
+            else:
+                return
+        ck = torch.load(path, map_location="cpu")
+        dev = next(self.siglip_condition_model.parameters()).device
+        self.siglip_condition_model.load_state_dict(ck["model"])
+        self.siglip_condition_model.to(dev)
+        if "reinforce_optimizer" in ck:
+            self.siglip_condition_reinforce_optimizer.load_state_dict(
+                ck["reinforce_optimizer"]
+            )
+        elif "optimizer" in ck:
+            self.siglip_condition_reinforce_optimizer.load_state_dict(ck["optimizer"])
+        if "grpo_optimizer" in ck:
+            self.siglip_condition_grpo_optimizer.load_state_dict(ck["grpo_optimizer"])
+        if "baseline" in ck:
+            self._cond_baseline = ck["baseline"].to(
+                device=dev, dtype=self._cond_baseline.dtype
+            )
+        if "vla_step_counter" in ck:
+            self._vla_step_counter = int(ck["vla_step_counter"])
 
     def set_global_step(self, global_step) -> None:
         """
         Set the global step for the model, if needed.
         """
+        self._runner_global_step = int(global_step)
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)

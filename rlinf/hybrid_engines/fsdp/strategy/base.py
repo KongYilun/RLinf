@@ -207,8 +207,10 @@ class FSDPStrategyBase(ABC):
         if torch.distributed.get_rank() == 0:
             os.makedirs(sd_save_path, exist_ok=True)
             torch.save(model_state_dict, os.path.join(sd_save_path, "full_weights.pt"))
+        del model_state_dict
 
         torch.distributed.barrier()
+        clear_memory()
 
     @classmethod
     def load_checkpoint(

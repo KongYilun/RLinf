@@ -77,6 +77,16 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         self.max_prompt_length = max_prompt_length
 
+        self.intruction_to_z_map = torch.load(
+            "libero_object_per_instruction_centers.pt"
+        )
+        self.instruction_to_task_id_map = torch.load(
+            "libero_object_instruction_to_task_id_map.pt"
+        )
+        self.task_id_to_instruction_map = {
+            int(v): k for k, v in self.instruction_to_task_id_map.items()
+        }
+
     def _build_embedding(self, input_ids, attention_mask, pixel_values):
         assert torch.all(input_ids[:, -1] == STOP_INDEX)
         assert input_ids.shape[0] == attention_mask.shape[0]
@@ -212,6 +222,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         calculate_logprobs=True,
         calculate_values=True,
         return_obs=True,
+        z_ids=None,
         **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         do_sample = kwargs.pop("do_sample")
@@ -316,6 +327,56 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         mm_embeddings, mm_attention_mask = self._build_embedding(
             input_ids, attention_mask, pixel_values
         )
+        z_embedding = None
+        task_ids = None
+        # from ray.util import pdb; pdb.set_trace()
+        if z_ids is not None:
+            # map instructions to integer task ids for logging / training
+            task_ids = torch.stack(
+                [
+                    self.instruction_to_task_id_map[instruction]
+                    for instruction in env_obs["task_descriptions"]
+                ],
+                dim=0,
+            ).to(mm_embeddings.device)
+
+            # z_ids can be either:
+            # - 1D int tensor of discrete indices into per-instruction centers
+            # - 2D float tensor containing the actual z-embeddings
+            if z_ids.dim() == 2:
+                # treat z_ids as already being the z-embedding
+                z_embedding = z_ids.to(
+                    device=mm_embeddings.device, dtype=mm_embeddings.dtype
+                ).unsqueeze(1)
+            else:
+                # legacy: z_ids are discrete ids; look up cluster centers
+                z_embedding_list = [
+                    self.intruction_to_z_map[instruction][int(z_id.item())]
+                    for instruction, z_id in zip(
+                        env_obs["task_descriptions"], z_ids
+                    )
+                ]
+                z_embedding = (
+                    torch.stack(z_embedding_list, dim=0)
+                    .to(mm_embeddings.device)
+                    .unsqueeze(1)
+                    .to(mm_embeddings.dtype)
+                )
+
+            mm_embeddings = torch.cat(
+                [mm_embeddings[:, :-56, :], z_embedding, mm_embeddings[:, -56:, :]],
+                dim=1,
+            )
+            z_attention = torch.full(
+                (mm_embeddings.size(0), 1),
+                True,
+                dtype=torch.bool,
+                device=mm_embeddings.device,
+            ).to(mm_attention_mask.dtype)
+            mm_attention_mask = torch.cat(
+                [mm_attention_mask[:, :-56], z_attention, mm_attention_mask[:, -56:]],
+                dim=1,
+            )
         multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
         # Forward pass through language model
@@ -338,9 +399,9 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         logits_tensor = outputs.logits[
             :,
-            n_patches + n_prompt_tokens : n_patches
+            n_patches + n_prompt_tokens+1 : n_patches
             + n_prompt_tokens
-            + self.action_dim * self.num_action_chunks,
+            + self.action_dim * self.num_action_chunks+1,
             :,
         ]  # [B, act, vocab_size + 64]
 
@@ -428,6 +489,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "prev_logprobs": chunk_logprobs,
             "prev_values": chunk_values,
             "forward_inputs": forward_inputs,
+            "task_ids": task_ids,
         }
 
         return chunk_actions, result
@@ -474,6 +536,8 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         compute_values: bool = False,
         use_cache: Optional[bool] = None,
     ):
+        z_ids=None
+        task_ids=None
         if data is not None:
             data = self.preprocess_for_train(data)
             input_ids = data["input_ids"]
@@ -481,6 +545,8 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             pixel_values = data["pixel_values"]
 
             action_tokens = data["action_tokens"]
+            z_ids = data['z_ids']
+            task_ids = data['task_ids']
 
         assert torch.all(input_ids[:, 0] == 1)
         assert torch.all(attention_mask[:, 0] == 1)
@@ -505,6 +571,44 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         mm_embeddings, mm_attention_mask = self._build_embedding(
             input_ids, attention_mask, pixel_values
         )
+        if z_ids is not None:
+            instructions = [
+                self.task_id_to_instruction_map[int(task_id.item())]
+                for task_id in task_ids
+            ]
+
+            if z_ids.dim() == 2:
+                # z_ids already contains the continuous z-embedding
+                z_embedding = z_ids.to(
+                    device=mm_embeddings.device, dtype=mm_embeddings.dtype
+                ).unsqueeze(1)
+            else:
+                # legacy: look up cluster centers by discrete id
+                z_embedding_list = [
+                    self.intruction_to_z_map[instruction][int(z_id.item())]
+                    for instruction, z_id in zip(instructions, z_ids)
+                ]
+                z_embedding = (
+                    torch.stack(z_embedding_list, dim=0)
+                    .to(mm_embeddings.device)
+                    .unsqueeze(1)
+                    .to(mm_embeddings.dtype)
+                )
+
+            mm_embeddings = torch.cat(
+                [mm_embeddings[:, :-56, :], z_embedding, mm_embeddings[:, -56:, :]],
+                dim=1,
+            )
+            z_attention = torch.full(
+                (mm_embeddings.size(0), 1),
+                True,
+                dtype=torch.bool,
+                device=mm_embeddings.device,
+            ).to(mm_attention_mask.dtype)
+            mm_attention_mask = torch.cat(
+                [mm_attention_mask[:, :-56], z_attention, mm_attention_mask[:, -56:]],
+                dim=1,
+            )
         multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
         if compute_values:
