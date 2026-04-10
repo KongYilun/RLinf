@@ -147,7 +147,6 @@ class SiglipConditionModel(nn.Module):
         center_emb = self.cluster_embed(pred_idx)
         combined_input = torch.cat((embedding, center_emb), dim=1)
         residual_embedding = self.residual_head(combined_input)
-
         return {
             "embedding": embedding,
             "logits_c": logits_c,
@@ -186,12 +185,11 @@ class SiglipConditionRLModel(SiglipConditionModel):
     ) -> None:
         """
         Use a dedicated ``torch.Generator`` for cluster / residual sampling in ``forward``.
-        Call after ``.to(device)`` on the **rollout** worker (sampling only happens there).
-        Actor paths ``forward_z_for_actor_grpo`` / ``evaluate_log_prob`` are deterministic;
-        no need to call this on the actor copy.
+        Call after ``.to(device)``. Per-rank seeds (e.g. ``base_seed + rank``) avoid
+        identical samples across distributed rollout ranks.
 
-        Per-rank seeds (e.g. ``base_seed + rollout_rank``) avoid identical samples across
-        distributed rollout ranks. Omit this call to use the global PyTorch RNG (legacy).
+        Pass ``seed`` deterministically from config; omit this call to keep using the
+        global PyTorch RNG (legacy behavior).
         """
         self._condition_policy_sampling_seed = int(seed)
         if device.type == "cuda":
@@ -285,7 +283,6 @@ class SiglipConditionRLModel(SiglipConditionModel):
                 residual_sample = r_dist.rsample() if self.training else r_dist.sample()
 
         log_prob_residual = r_dist.log_prob(residual_sample.float())
-
         return {
             "embedding": embedding,
             "logits_c": logits_c,

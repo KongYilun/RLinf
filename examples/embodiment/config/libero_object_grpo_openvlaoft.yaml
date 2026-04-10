@@ -58,6 +58,9 @@ algorithm:
     weight_decay: 0.01
     grad_clip: null
     micro_batch_size: 32
+    reinforce_adv_mode: global # global | per_task
+    reinforce_per_task_adv_standardize: true
+    cluster_entropy_coef: 0.0
 
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty

@@ -4,9 +4,10 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
-export MUJOCO_GL="osmesa"
-export PYOPENGL_PLATFORM="osmesa"
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
+
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
 # Only required when running the behavior experiment.
@@ -22,6 +23,8 @@ export CARB_APP_PATH=${CARB_APP_PATH:-$ISAAC_PATH/kit}
 
 export ROBOTWIN_PATH="/path/to/RoboTwin"
 export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
+export LIBERO_REPO_PATH="/opt/libero"
+export PYTHONPATH=${REPO_PATH}:${LIBERO_REPO_PATH}:$PYTHONPATH
 
 export CUDA_LAUNCH_BLOCKING=1
 export HYDRA_FULL_ERROR=1
@@ -37,6 +40,13 @@ ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
 
 export ROBOT_PLATFORM
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
+
+export WANDB_ENTITY="kongyilun333"
+export WANDB_API_KEY=227446d2817003989abaf27aff2159a908b483e2
+# export WANDB_MODE="offline"
+
+export RAY_PDB=1
+export RAY_DEBUG=legacy
 
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"

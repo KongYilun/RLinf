@@ -8,6 +8,7 @@ label 与 residual（与 train_condition_model 一致）。
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -18,10 +19,46 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from condition_model_sto_new import SiglipConditionModel
+from condition_model_sto_new import SiglipConditionModel,SiglipConditionRLModel
 
 # 复用训练脚本的数据构建（避免重复维护 RLDS 逻辑）
 from train_condition_model import ROOT_DIR, LiberoFirstFrameDataset
+
+
+def set_seed(seed: int) -> None:
+    """Fix Python / NumPy / PyTorch RNG and prefer deterministic CUDA kernels where supported."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _dataloader_worker_init_fn(_worker_id: int) -> None:
+    w_seed = torch.initial_seed() % 2**32
+    np.random.seed(w_seed)
+    random.seed(w_seed)
+
+
+def _sort_rlds_samples_for_repro(samples: List[dict]) -> List[dict]:
+    """
+    ``dataset.as_numpy_iterator()`` 依赖 TFDS 分片/预取顺序，跨次运行顺序常不同。
+    按 (episode_id, instruction) 稳定排序，并用原始下标打破并列，保证 DataLoader 批顺序可复现。
+    """
+    indexed = list(enumerate(samples))
+    indexed.sort(key=lambda t: (str(t[1]["episode_id"]), t[1]["instruction"], t[0]))
+    return [t[1] for t in indexed]
 
 
 @torch.no_grad()
@@ -47,6 +84,7 @@ def evaluate_siglip_condition_model(
         n_argmax_match = 0
         per_task_correct: Dict[str, int] = defaultdict(int)
         per_task_total: Dict[str, int] = defaultdict(int)
+        per_task_predict: Dict[str, list[int]] = defaultdict(list)
 
         for batch in loader:
             images = batch["image"]
@@ -58,18 +96,22 @@ def evaluate_siglip_condition_model(
             out_gt = model(
                 images=images,
                 instructions=instructions,
-                cluster_ids_for_residual=labels,
+                deterministic_cluster=True,
+                # cluster_ids_for_residual=None
             )
-            out_am = model(images=images, instructions=instructions, cluster_ids_for_residual=None)
-            import ipdb; ipdb.set_trace()
+            out_am = model(images=images, instructions=instructions, deterministic_cluster=False)
+            # cluster_ids_for_residual=None
+            
             logits = out_gt["logits_c"]
             pred_cls = logits.argmax(dim=-1)
+            import ipdb; ipdb.set_trace()
             match_vec = pred_cls == labels
             correct_cls += match_vec.sum().item()
 
             for i in range(bsz):
                 inst = instructions[i]
                 per_task_total[inst] += 1
+                per_task_predict[inst].append(pred_cls[i].item())
                 if bool(match_vec[i].item()):
                     per_task_correct[inst] += 1
 
@@ -118,6 +160,7 @@ def evaluate_siglip_condition_model(
                 c_t = per_task_correct[inst]
                 acc_t = c_t / max(n_t, 1)
                 print(f"{pre}n={n_t:4d}  acc={acc_t:.4f}  ({c_t}/{n_t})  |  {inst}")
+                print(f"{pre}predict: {per_task_predict[inst]}")
 
         return {
             "accuracy": float(acc),
@@ -173,6 +216,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="使用 make_single_dataset(train=False)。默认 train=True（与 train_condition_model 一致）",
     )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="全局随机种子（Python / NumPy / PyTorch；DataLoader worker 由此派生）。",
+    )
     return p.parse_args()
 
 
@@ -201,7 +250,7 @@ def _build_rlds_first_frame_samples_split(
     episode_to_supervision: Dict[str, Tuple[int, np.ndarray]],
     train: bool,
 ) -> List[dict]:
-    """与 train_condition_model.build_rlds_first_frame_samples 相同，增加 train 开关。"""
+    """与 train_condition_model.build_rlds_first_frame_samples 相同，增加 train 开关；返回前稳定排序以利复现。"""
     OPENVLA_COND_DIR = ROOT_DIR / "step2_warmup" / "openvla-oft-conditioned"
     if str(OPENVLA_COND_DIR) not in sys.path:
         sys.path.insert(0, str(OPENVLA_COND_DIR))
@@ -268,17 +317,19 @@ def _build_rlds_first_frame_samples_split(
                 "residual": residual,
             }
         )
-    return samples
+    return _sort_rlds_samples_for_repro(samples)
 
 
 def main() -> None:
     args = parse_args()
+    set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"seed={args.seed} (device={device})")
 
     episode_to_supervision, num_classes, residual_dim = build_episode_supervision(args.clusters_path)
     print(f"Clusters: {len(episode_to_supervision)} episodes, num_classes={num_classes}, residual_dim={residual_dim}")
 
-    rlds_train = not args.rlds_eval_split
+    rlds_train = True
     samples = _build_rlds_first_frame_samples_split(
         dataset_root=args.dataset_root,
         dataset_name=args.dataset_name,
@@ -292,11 +343,15 @@ def main() -> None:
         )
 
     dataset = LiberoFirstFrameDataset(samples=samples)
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(args.seed)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        worker_init_fn=_dataloader_worker_init_fn if args.num_workers > 0 else None,
+        generator=loader_generator,
     )
     print(f"Eval samples: {len(dataset)} (dataset_name={args.dataset_name}, rlds_train={rlds_train})")
 
@@ -304,17 +359,21 @@ def main() -> None:
         raise FileNotFoundError(f"Missing checkpoint: {args.ckpt_path}")
 
     ckpt = torch.load(args.ckpt_path, map_location=device)
+    print(f"ckpt path: {args.ckpt_path}")
     state_dict = ckpt.get("model_state_dict", ckpt)
-    siglip_model_path = ckpt.get("siglip_model_path", "/data/users/kongyilun/models/siglip-so400m-patch14-384")
+    siglip_model_path = ckpt.get("siglip_model_path", "/data/users/kongyilun/models/siglip-so400m-patch14-384")#"/data/users/kongyilun/code/rlinf-condition/step3_encoder_training/siglip_condition_model_sto_0.pt"
+    #
     center_embed_dim = int(ckpt.get("center_embed_dim", 512))
-
-    model = SiglipConditionModel(
+    print(f"siglip_model_path: {siglip_model_path}")
+    model = SiglipConditionRLModel(
         model_path=siglip_model_path,
         num_classes=num_classes,
         residual_dim=residual_dim,
         center_embed_dim=center_embed_dim,
     )
-    model.load_state_dict(state_dict, strict=False)
+    # import ipdb; ipdb.set_trace()
+    tmp=torch.load("/data/users/kongyilun/code/rlinf-condition/logs/20260406-16:12:22-libero_object_grpo_openvlaoft_opt.yaml/libero_object_z_generator_konly_refined_new/checkpoints/global_step_25/condition_policy.pt", map_location="cpu")
+    model.load_state_dict(tmp['model'], strict=False)
     model.to(device)
 
     evaluate_siglip_condition_model(model, loader, device, log_prefix="")

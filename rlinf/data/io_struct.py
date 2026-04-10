@@ -1261,6 +1261,8 @@ class ChunkStepResult:
     cond_residual: Optional[torch.Tensor] = None
     cond_initial_image_hwc: Optional[torch.Tensor] = None  # [B, H, W, 3] uint8
     cond_pred_cluster_idx: Optional[torch.Tensor] = None  # [B] long
+    # 1.0 if geometric z used sampled residual; 0.0 if center-only (cluster schedule or argmax gate).
+    cond_residual_applied: Optional[torch.Tensor] = None  # [B] float32
 
     def __post_init__(self):
         if self.prev_logprobs is not None:
@@ -1293,6 +1295,8 @@ class ChunkStepResult:
             self.cond_initial_image_hwc = self.cond_initial_image_hwc.cpu().contiguous()
         if self.cond_pred_cluster_idx is not None:
             self.cond_pred_cluster_idx = self.cond_pred_cluster_idx.cpu().contiguous()
+        if self.cond_residual_applied is not None:
+            self.cond_residual_applied = self.cond_residual_applied.cpu().contiguous()
 
 
 @dataclass(kw_only=True)
@@ -1336,6 +1340,7 @@ class EmbodiedRolloutResult:
     cond_initial_image_hwc: list[torch.Tensor] = field(default_factory=list)
     cond_task_ids: list[torch.Tensor] = field(default_factory=list)
     cond_pred_cluster_idx: list[torch.Tensor] = field(default_factory=list)
+    cond_residual_applied: list[torch.Tensor] = field(default_factory=list)
 
     def append_result(self, result: ChunkStepResult):
         if result.prev_logprobs is not None:
@@ -1364,6 +1369,14 @@ class EmbodiedRolloutResult:
             self.cond_initial_image_hwc.append(result.cond_initial_image_hwc)
             self.cond_task_ids.append(result.task_ids)
             self.cond_pred_cluster_idx.append(result.cond_pred_cluster_idx)
+            if result.cond_residual_applied is not None:
+                self.cond_residual_applied.append(result.cond_residual_applied)
+            else:
+                self.cond_residual_applied.append(
+                    torch.ones_like(
+                        result.cond_pred_cluster_idx, dtype=torch.float32
+                    ).cpu().contiguous()
+                )
 
     def add_transition(self, obs, next_obs):
         self.transitions.append(
@@ -1452,6 +1465,9 @@ class EmbodiedRolloutResult:
             )
             rollout_result_dict["cond_pred_cluster_idx"] = _expand_along_chunks(
                 torch.stack(self.cond_pred_cluster_idx, dim=0).cpu().contiguous()
+            )
+            rollout_result_dict["cond_residual_applied"] = _expand_along_chunks(
+                torch.stack(self.cond_residual_applied, dim=0).cpu().contiguous()
             )
 
         merged_forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)

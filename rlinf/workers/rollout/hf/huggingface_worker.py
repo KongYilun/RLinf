@@ -54,6 +54,7 @@ class MultiStepRolloutWorker(Worker):
 
         self.actor_group_name = cfg.actor.group_name
         self.device = torch.cuda.current_device()
+        self._rollout_runner_step = 0
 
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.rollout.get("enable_offload", False)
@@ -89,6 +90,18 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.offload_model()
 
+    def _maybe_init_condition_policy_sampling_generator(
+        self, model: SiglipConditionRLModel
+    ) -> None:
+        raw = self.condition_policy_cfg.get("sampling_seed", None)
+        if raw is None:
+            return
+        base = int(raw)
+        if bool(self.condition_policy_cfg.get("sampling_seed_add_rollout_rank", True)):
+            base += int(self._rank)
+        dev = next(model.parameters()).device
+        model.init_condition_policy_sampling_generator(dev, base)
+
     def _init_condition_model_and_centers(self):
         """
         Load SigLIP-based condition model and per-instruction cluster centers.
@@ -100,14 +113,44 @@ class MultiStepRolloutWorker(Worker):
         device = self.device
         device_str = f"cuda:{device}" if isinstance(device, int) else device
 
-        ckpt_path = self.condition_policy_cfg.get(
-            "checkpoint_path", None
+        ckpt_path = (
+            self.condition_policy_cfg.get("eval_checkpoint_path")
+            or self.condition_policy_cfg.get("checkpoint_path", None)
         ) or "step3_encoder_training/siglip_condition_model_sto.pt"
         ckpt = torch.load(ckpt_path, map_location=device_str)
-        num_classes: int = ckpt["num_classes"]
-        residual_dim: int = ckpt["residual_dim"]
-        siglip_model_path: str = ckpt["siglip_model_path"]
-        center_embed_dim: int = int(ckpt.get("center_embed_dim", 512))
+        # from ray.util import pdb; pdb.set_trace()
+        def _meta_from_ckpt(c):
+            return (
+                int(c["num_classes"]),
+                int(c["residual_dim"]),
+                str(c["siglip_model_path"]),
+                int(c.get("center_embed_dim", 512)),
+            )
+
+        if "num_classes" in ckpt:
+            num_classes, residual_dim, siglip_model_path, center_embed_dim = _meta_from_ckpt(
+                ckpt
+            )
+            if isinstance(ckpt.get("model"), dict):
+                state_dict = ckpt["model"]
+            else:
+                state_dict = ckpt.get("model_state_dict", ckpt)
+        elif isinstance(ckpt.get("model"), dict):
+            meta_path = self.condition_policy_cfg.get("checkpoint_path", None) or (
+                "step3_encoder_training/siglip_condition_model_sto.pt"
+            )
+            meta = torch.load(meta_path, map_location="cpu")
+            num_classes, residual_dim, siglip_model_path, center_embed_dim = _meta_from_ckpt(
+                meta
+            )
+            state_dict = ckpt["model"]
+            del meta
+        else:
+            raise ValueError(
+                f"Unrecognized condition checkpoint format at {ckpt_path!r}: "
+                "need full SFT/RL ckpt with num_classes, or actor condition_policy.pt "
+                "with 'model' plus algorithm.condition_policy.checkpoint_path for metadata."
+            )
 
         model = SiglipConditionRLModel(
             model_path=siglip_model_path,
@@ -115,12 +158,12 @@ class MultiStepRolloutWorker(Worker):
             residual_dim=residual_dim,
             center_embed_dim=center_embed_dim,
         )
-        state_dict = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict(state_dict, strict=False)
         model.to(device)
         # if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         #     model.to(dtype=torch.bfloat16)
         model.eval()
+        self._maybe_init_condition_policy_sampling_generator(model)
         self.siglip_condition_model = model
 
         # per-instruction cluster centers: instruction -> [num_clusters, D]
@@ -128,6 +171,141 @@ class MultiStepRolloutWorker(Worker):
         instruction_centers = torch.load(centers_path, map_location="cpu")
         # keep tensors on CPU; move slices to CUDA on demand
         self.instruction_centers = instruction_centers
+
+    def _obs_image_hwc_uint8_numpy(self, img: torch.Tensor):
+        img = img.detach().cpu()
+        if img.ndim != 3:
+            raise RuntimeError(f"Unexpected image rank for SigLIP: {img.shape}")
+        if img.shape[-1] == 3:
+            img_hwc = img
+        elif img.shape[0] == 3:
+            img_hwc = img.permute(1, 2, 0)
+        else:
+            raise RuntimeError(
+                f"Cannot infer channel dimension from shape {img.shape}"
+            )
+        if img_hwc.dtype.is_floating_point:
+            img_hwc = (img_hwc.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        elif img_hwc.dtype != torch.uint8:
+            img_hwc = img_hwc.to(torch.uint8)
+        return img_hwc.numpy()
+
+    def _condition_policy_runner_step(self) -> int:
+        return int(getattr(self, "_rollout_runner_step", 0))
+
+    def _effective_cluster_only(self) -> bool:
+        """Schedule overrides static ``cluster_only`` when ``cluster_only_schedule_end_step`` is set."""
+        cp = self.condition_policy_cfg
+        end = cp.get("cluster_only_schedule_end_step", None)
+        if end is None:
+            return bool(cp.get("cluster_only", False))
+        start = int(cp.get("cluster_only_schedule_start_step", 0))
+        g = self._condition_policy_runner_step()
+        return int(start) <= g <= int(end)
+
+    def _residual_when_sample_matches_argmax_only(self) -> bool:
+        return bool(
+            self.condition_policy_cfg.get(
+                "residual_when_sample_matches_argmax_only", False
+            )
+        )
+
+    def _z_from_siglip_row(
+        self,
+        instr: str,
+        pred_idx: int,
+        argmax_idx: int,
+        residual_1d: torch.Tensor,
+    ) -> tuple[torch.Tensor, float]:
+        """
+        Geometric z for VLA: center from file [+ residual].
+        Returns (z_vector, cond_residual_applied scalar 0.0 or 1.0 for GRPO gating).
+        """
+        centers_per_instr = self.instruction_centers[instr]
+        center_vec = centers_per_instr[int(pred_idx)].to(
+            residual_1d.device, dtype=residual_1d.dtype
+        )
+        if self._effective_cluster_only():
+            return center_vec, 0.0
+        if not self._residual_when_sample_matches_argmax_only():
+            return center_vec + residual_1d, 1.0
+        if int(pred_idx) == int(argmax_idx):
+            return center_vec + residual_1d, 1.0
+        return center_vec, 0.0
+
+    def _instruction_strings_for_batch(self, task_desc, batch_size: int) -> list[str]:
+        out: list[str] = []
+        if isinstance(task_desc, (list, tuple)):
+            for i in range(batch_size):
+                td = task_desc[i]
+                if isinstance(td, bytes):
+                    td = td.decode("utf-8")
+                out.append(str(td))
+        elif isinstance(task_desc, torch.Tensor):
+            for i in range(batch_size):
+                td = task_desc[i].item()
+                if isinstance(td, bytes):
+                    td = td.decode("utf-8")
+                out.append(str(td))
+        else:
+            td = task_desc
+            if isinstance(td, bytes):
+                td = td.decode("utf-8")
+            s = str(td)
+            out = [s] * batch_size
+        return out
+
+    def _build_z_batch_per_env_from_obs(self, obs: dict[str, Any]) -> torch.Tensor:
+        """
+        One SigLIP forward over ``batch_size`` envs; each row gets its own image + instruction
+        and ``z_i = center(instruction_i, cluster_i) [+ residual_i]``. For pure eval with
+        ``group_size=1``, each env differs.
+        """
+        main_images = obs.get("main_images", None)
+        task_desc = obs.get("task_descriptions", None)
+        # from ray.util import pdb; pdb.set_trace()
+        if main_images is None or task_desc is None:
+            raise RuntimeError(
+                "main_images or task_descriptions missing in env obs for condition embedding."
+            )
+        imgs = main_images
+        if imgs.ndim == 5:
+            imgs = imgs[:, 0]
+        bsz = int(imgs.shape[0])
+        images_list = [self._obs_image_hwc_uint8_numpy(imgs[i]) for i in range(bsz)]
+        instructions = self._instruction_strings_for_batch(task_desc, bsz)
+
+        siglip_temp = float(
+            self.condition_policy_cfg.get(
+                "cluster_sample_temperature",
+                self.cfg.algorithm.get("siglip_cluster_sample_temperature", 1.0),
+            )
+        )
+        det_c = bool(self.condition_policy_cfg.get("deterministic_cluster_eval", True))
+        det_r = bool(self.condition_policy_cfg.get("deterministic_residual_eval", True))
+        with torch.no_grad():
+            siglip_outputs = self.siglip_condition_model(
+                images=images_list,
+                instructions=instructions,
+                cluster_sample_temperature=siglip_temp,
+                deterministic_cluster=det_c,
+                deterministic_residual=det_r,
+            )
+        residual = siglip_outputs["residual_embedding"]
+        pred_idx = siglip_outputs["pred_cluster_idx"]
+        argmax_idx = siglip_outputs.get("argmax_cluster_idx")
+        if argmax_idx is None:
+            argmax_idx = siglip_outputs["logits_c"].argmax(dim=-1)
+        z_rows = []
+        for i in range(bsz):
+            z_i, _ = self._z_from_siglip_row(
+                instructions[i],
+                int(pred_idx[i].item()),
+                int(argmax_idx[i].item()),
+                residual[i],
+            )
+            z_rows.append(z_i)
+        return torch.stack(z_rows, dim=0).to(self.device)
 
     def setup_sample_params(self):
         # length parameters for rollout
@@ -443,19 +621,23 @@ class MultiStepRolloutWorker(Worker):
                             cluster_id = int(
                                 siglip_outputs["pred_cluster_idx"][0].item()
                             )
-                            centers_per_instr = self.instruction_centers[instr0]
-                            center_vec = centers_per_instr[cluster_id].to(
-                                residual.device, dtype=residual.dtype
+                            # print(cluster_id)
+                            argmax_c = int(
+                                siglip_outputs["argmax_cluster_idx"][0].item()
                             )
-                            z_vec = center_vec + residual
+                            z_vec, ra = self._z_from_siglip_row(
+                                instr0, cluster_id, argmax_c, residual
+                            )
                             # broadcast same z-embedding to all envs in the group
                             z_batch = z_vec.unsqueeze(0).expand(B, -1).contiguous()
+                            # from ray.util import pdb; pdb.set_trace()
                             group_latents[stage_id] = z_batch.to(self.device)
                             if self.condition_policy_enable_rl:
                                 pending_cond_meta[stage_id] = {
                                     "siglip_outputs": siglip_outputs,
                                     "img0_hwc": img0_hwc,
                                     "B": B,
+                                    "cond_residual_applied": float(ra),
                                 }
 
                         z_ids = group_latents[stage_id]
@@ -503,6 +685,8 @@ class MultiStepRolloutWorker(Worker):
                             .detach()
                             .cpu()
                         )
+                        ra = float(cond_meta.get("cond_residual_applied", 1.0))
+                        cra = torch.full((Bm,), ra, dtype=torch.float32)
                         cond_kwargs = {
                             "cond_log_prob_cluster": lp_c,
                             "cond_log_prob_residual": lp_r,
@@ -510,6 +694,7 @@ class MultiStepRolloutWorker(Worker):
                             "cond_residual": res_b,
                             "cond_initial_image_hwc": img_b,
                             "cond_pred_cluster_idx": pc,
+                            "cond_residual_applied": cra,
                         }
 
                     chunk_step_result = ChunkStepResult(
@@ -576,6 +761,20 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.offload_model()
 
+    def _release_rollout_memory_after_eval(self) -> None:
+        """Move rollout models to CPU and release CUDA caches after eval (reduces idle RAM/VRAM)."""
+        self.hf_model = self.hf_model.to("cpu")
+        if self.use_optimizable_embedding and self.siglip_condition_model is not None:
+            self.siglip_condition_model.to("cpu")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            ipc = getattr(torch.cuda, "ipc_collect", None)
+            if callable(ipc):
+                ipc()
+        gc.collect()
+
     async def evaluate(self, input_channel: Channel, output_channel: Channel):
         if self.enable_offload:
             self.reload_model()
@@ -589,25 +788,46 @@ class MultiStepRolloutWorker(Worker):
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
         ):
-            random_nums = torch.tensor([0, 1, 2], dtype=torch.long).to(self.device)
-            random_nums = random_nums.repeat(self.cfg.env.eval.total_num_envs//self.placement.get_world_size("actor")//3)
+            group_latents = (
+                [None for _ in range(self.num_pipeline_stages)]
+                if self.use_optimizable_embedding
+                else None
+            )
             for _ in range(n_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+                for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
                     extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                    actions, _ = self.predict(extracted_obs, random_nums, mode="eval")
+                    if self.use_optimizable_embedding:
+                        if group_latents[stage_id] is None:
+                            group_latents[stage_id] = self._build_z_batch_per_env_from_obs(
+                                env_output["obs"]
+                            )
+                        z_ids = group_latents[stage_id]
+                    else:
+                        obs = env_output["obs"]
+                        mi = obs["main_images"]
+                        b = int(mi.shape[0]) if mi.ndim >= 1 else 1
+                        z_ids = torch.randint(
+                            0, 10, (b,), device=self.device, dtype=torch.long
+                        )
+                    actions, _ = self.predict(extracted_obs, z_ids, mode="eval")
                     self.send_chunk_actions(output_channel, actions, mode="eval")
 
         if self.enable_offload:
             self.offload_model()
+        # self._release_rollout_memory_after_eval()
 
     def offload_model(self):
         self.hf_model = self.hf_model.to("cpu")
+        if self.use_optimizable_embedding and self.siglip_condition_model is not None:
+            self.siglip_condition_model.to("cpu")
         gc.collect()
         torch.cuda.empty_cache()
 
     def reload_model(self):
         self.hf_model = self.hf_model.to(self.device)
+        if self.use_optimizable_embedding and self.siglip_condition_model is not None:
+            self.siglip_condition_model.to(self.device)
 
     async def recv_env_output(
         self, input_channel: Channel, mode="train"
@@ -639,5 +859,6 @@ class MultiStepRolloutWorker(Worker):
         return split_num
 
     def set_global_step(self, global_step):
+        self._rollout_runner_step = int(global_step)
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

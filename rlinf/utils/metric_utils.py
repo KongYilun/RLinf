@@ -14,6 +14,7 @@
 
 import math
 
+import numpy as np
 import torch
 import torch.distributed
 
@@ -52,6 +53,22 @@ def count_trajectories(metrics_dict):
         raise TypeError(f"Unsupported tensor type: {type(first_tensor)}")
 
 
+def _tensor_list_global_mean_numpy(tensors: list[torch.Tensor]) -> np.ndarray:
+    """Mean over all elements without torch.concat (avoids a large temporary buffer)."""
+    total = 0.0
+    count = 0
+    for t in tensors:
+        tf = t.float()
+        c = tf.numel()
+        if c == 0:
+            continue
+        total += float(tf.sum().item())
+        count += c
+    if count == 0:
+        return np.array(float("nan"))
+    return np.array(total / count)
+
+
 def compute_evaluate_metrics(eval_metrics_list):
     """
     List of evaluate metrics, list length stands for rollout process
@@ -70,14 +87,9 @@ def compute_evaluate_metrics(eval_metrics_list):
         trajectory_counts.append(count)
 
     for env_info_key in env_info_keys:
-        all_eval_metrics[env_info_key] = [
-            eval_metrics[env_info_key] for eval_metrics in eval_metrics_list
-        ]
-
-    for key in all_eval_metrics:
-        all_eval_metrics[key] = (
-            torch.concat(all_eval_metrics[key]).float().mean().numpy()
-        )
+        per_rank = [eval_metrics[env_info_key] for eval_metrics in eval_metrics_list]
+        all_eval_metrics[env_info_key] = _tensor_list_global_mean_numpy(per_rank)
+        del per_rank
 
     # Add total trajectory count to metrics
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)

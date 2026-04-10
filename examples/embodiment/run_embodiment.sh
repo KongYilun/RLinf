@@ -51,3 +51,4 @@ CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${C
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
 
+sleep inf

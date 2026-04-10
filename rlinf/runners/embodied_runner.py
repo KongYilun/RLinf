@@ -254,6 +254,14 @@ class EmbodiedRunner:
         if self.cfg.runner.get("prune_previous_actor_dcp", False):
             prev = self._last_saved_step
             if prev is not None and prev != self.global_step:
+                keep_raw = self.cfg.runner.get(
+                    "prune_previous_actor_dcp_keep_steps", [50]
+                )
+                keep_steps = (
+                    {int(x) for x in keep_raw}
+                    if keep_raw is not None
+                    else set()
+                )
                 checkpoints_root = os.path.join(
                     self.cfg.runner.logger.log_path,
                     self.cfg.runner.logger.experiment_name,
@@ -265,7 +273,12 @@ class EmbodiedRunner:
                     "actor",
                     "dcp_checkpoint",
                 )
-                if os.path.isdir(prev_dcp):
+                if prev in keep_steps:
+                    logger.info(
+                        "Skipping DCP prune for protected checkpoint global_step_%s",
+                        prev,
+                    )
+                elif os.path.isdir(prev_dcp):
                     shutil.rmtree(prev_dcp)
                     logger.info("Removed previous actor DCP: %s", prev_dcp)
 

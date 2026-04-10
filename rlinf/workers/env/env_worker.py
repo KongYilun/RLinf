@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 from collections import defaultdict
 from typing import Any
 
@@ -25,6 +26,35 @@ from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.env_manager import EnvManager
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.placement import HybridComponentPlacement
+
+
+def _concat_metric_tensors_lowmem(chunks: list[torch.Tensor]) -> torch.Tensor:
+    """Concat on dim=0 with lower peak RAM than torch.cat; drops chunk refs as we copy."""
+    if not chunks:
+        raise ValueError("_concat_metric_tensors_lowmem: empty chunk list")
+    if len(chunks) == 1:
+        t = chunks[0]
+        chunks.clear()
+        return t if t.is_contiguous() else t.contiguous()
+    device = chunks[0].device
+    dtype = chunks[0].dtype
+    rest = chunks[0].shape[1:]
+    total_0 = 0
+    for c in chunks:
+        if c.device != device or c.dtype != dtype or c.shape[1:] != rest:
+            out = torch.cat(chunks, dim=0)
+            chunks.clear()
+            return out if out.is_contiguous() else out.contiguous()
+        total_0 += int(c.shape[0])
+    out = torch.empty((total_0, *rest), dtype=dtype, device=device)
+    offset = total_0
+    while chunks:
+        c = chunks.pop()
+        n = int(c.shape[0])
+        offset -= n
+        out[offset : offset + n].copy_(c)
+    assert offset == 0
+    return out
 
 
 class EnvWorker(Worker):
@@ -393,7 +423,7 @@ class EnvWorker(Worker):
             env.stop_env()
 
         for key, value in env_metrics.items():
-            env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+            env_metrics[key] = _concat_metric_tensors_lowmem(value).cpu()
 
         return env_metrics
 
@@ -442,7 +472,12 @@ class EnvWorker(Worker):
                 self.eval_env_list[stage_id].close()
             self.eval_env_list[stage_id].stop_env()
 
+        gc.collect()
         for key, value in eval_metrics.items():
-            eval_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+            eval_metrics[key] = _concat_metric_tensors_lowmem(value).cpu()
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return eval_metrics

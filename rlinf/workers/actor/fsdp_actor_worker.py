@@ -1060,10 +1060,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             rb["cond_pred_cluster_idx"][0, idx].detach().cpu().clone()
         )
 
+    def _scheduled_cluster_only_phase_active(self) -> bool:
+        """Whether ``cluster_only_schedule_end_step`` is set and current runner step is inside it."""
+        cp = self.condition_policy_cfg
+        end = cp.get("cluster_only_schedule_end_step", None)
+        if end is None:
+            return False
+        start = int(cp.get("cluster_only_schedule_start_step", 0))
+        g = int(getattr(self, "_runner_global_step", 0))
+        return int(start) <= g <= int(end)
+
     def _cm_grpo_training_enabled(self) -> bool:
         if not self.condition_policy_enable_rl:
             return False
         if not self.cfg.algorithm.get("use_optimizable_embedding", False):
+            return False
+        if self._scheduled_cluster_only_phase_active():
             return False
         start = int(self.condition_policy_cfg.get("grpo_cm_start_step", 0))
         end = self.condition_policy_cfg.get("grpo_cm_end_step", None)
@@ -1143,8 +1155,108 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return grad_norm, lr_list
 
+    def _cond_reinforce_advantages(
+        self,
+        rewards_dev: torch.Tensor,
+        task_ids_cpu: torch.Tensor,
+        device: torch.device,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """REINFORCE advantages for condition policy: global z-score or per-task stats."""
+        mode = str(
+            self.condition_policy_cfg.get("reinforce_adv_mode", "global")
+        ).lower()
+        standardize_pt = bool(
+            self.condition_policy_cfg.get("reinforce_per_task_adv_standardize", True)
+        )
+
+        with torch.no_grad():
+            if dist.is_initialized() and self._world_size > 1:
+                n_loc = torch.tensor(
+                    float(rewards_dev.numel()),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                sum_loc = rewards_dev.sum()
+                sumsq_loc = (rewards_dev * rewards_dev).sum()
+                t = torch.stack([sum_loc, sumsq_loc, n_loc])
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                n_g = t[2].clamp(min=1.0)
+                mean_r = t[0] / n_g
+                var = t[1] / n_g - mean_r * mean_r
+                var = var.clamp(min=0.0)
+                std_r = torch.sqrt(var) + eps
+            else:
+                mean_r = rewards_dev.mean()
+                std_r = rewards_dev.std(unbiased=False) + eps
+
+            adv_global = (rewards_dev - mean_r) / std_r
+
+            if mode != "per_task":
+                return adv_global.detach(), mean_r, std_r
+
+            tid = task_ids_cpu.long().to(device=device)
+            tid_max = int(tid.max().item()) if tid.numel() > 0 else 0
+            if self._task_id_to_instruction:
+                map_max = max(self._task_id_to_instruction.keys())
+                num_tasks = max(tid_max, int(map_max)) + 1
+            else:
+                num_tasks = tid_max + 1
+
+            sum_t = torch.zeros(num_tasks, device=device, dtype=torch.float32)
+            cnt_t = torch.zeros(num_tasks, device=device, dtype=torch.float32)
+            sumsq_t = torch.zeros(num_tasks, device=device, dtype=torch.float32)
+            sum_t.scatter_add_(0, tid, rewards_dev)
+            cnt_t.scatter_add_(0, tid, torch.ones_like(rewards_dev))
+            sumsq_t.scatter_add_(0, tid, rewards_dev * rewards_dev)
+
+            if dist.is_initialized() and self._world_size > 1:
+                dist.all_reduce(sum_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(cnt_t, op=dist.ReduceOp.SUM)
+                dist.all_reduce(sumsq_t, op=dist.ReduceOp.SUM)
+
+            mean_t = sum_t / cnt_t.clamp(min=1.0)
+            var_t = sumsq_t / cnt_t.clamp(min=1.0) - mean_t * mean_t
+            var_t = var_t.clamp(min=0.0)
+            std_t = torch.sqrt(var_t) + eps
+
+            mean_i = mean_t[tid]
+            cnt_i = cnt_t[tid]
+
+            if standardize_pt:
+                std_i = std_t[tid]
+                adv_pt = (rewards_dev - mean_i) / std_i
+            else:
+                adv_pt = rewards_dev - mean_i
+
+            low_cnt = cnt_i < 2.0
+            adv = torch.where(low_cnt, adv_global, adv_pt)
+            return adv.detach(), mean_r, std_r
+
+    def _vla_micro_batch_effective(self) -> int:
+        """Optionally halve VLA actor micro-batch from ``half_micro_batch_from_runner_step``."""
+        base = int(self.cfg.actor.micro_batch_size)
+        if not bool(self.cfg.actor.get("half_micro_batch_enable", False)):
+            return base
+        thr = self.cfg.actor.get("half_micro_batch_from_runner_step", None)
+        if thr is None:
+            return base
+        g = int(getattr(self, "_runner_global_step", 0))
+        if g < int(thr):
+            return base
+        half = base // 2
+        assert half * 2 == base, (
+            "actor.micro_batch_size must be even when actor.half_micro_batch_enable is true"
+        )
+        return max(half, 1)
+
     def _train_condition_policy_if_due(self) -> dict[str, float]:
         if not self.condition_policy_enable_rl:
+            return {}
+        rds = self.condition_policy_cfg.get("reinforce_disable_from_runner_step", None)
+        if rds is not None and int(getattr(self, "_runner_global_step", 0)) >= int(
+            rds
+        ):
             return {}
         interval = int(self.condition_policy_cfg.get("update_interval_vla_steps", 5))
         if self._vla_step_counter == 0 or self._vla_step_counter % interval != 0:
@@ -1167,7 +1279,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.cfg.algorithm.get("siglip_cluster_sample_temperature", 1.0),
             )
         )
-        mom = float(self.condition_policy_cfg.get("baseline_momentum", 0.95))
 
         n = int(task_ids.shape[0])
         if n == 0:
@@ -1176,16 +1287,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rewards_dev = rewards.to(device=device, dtype=torch.float32)
 
         self.siglip_condition_model.train()
-        self.siglip_condition_reinforce_optimizer.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            # NCCL all_reduce requires GPU tensors; rewards from buffer are CPU.
-            r_mean = rewards_dev.mean()
-            if dist.is_initialized() and self._world_size > 1:
-                rm = r_mean.clone()
-                dist.all_reduce(rm, op=dist.ReduceOp.AVG)
-                r_mean = rm
-            self._cond_baseline.mul_(mom).add_((1.0 - mom) * r_mean)
-        adv = (rewards_dev - self._cond_baseline).detach()
+        eps = 1e-8
+        adv, mean_r, std_r = self._cond_reinforce_advantages(
+            rewards_dev, task_ids, device, eps
+        )
+        ent_coef = float(self.condition_policy_cfg.get("cluster_entropy_coef", 0.0))
+
+        self._cond_baseline.copy_(mean_r.reshape_as(self._cond_baseline))
 
         images_list = [images_u8[i].numpy() for i in range(n)]
         instructions = [
@@ -1195,59 +1303,75 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         residual_sample = residual.to(device=device, dtype=torch.float32)
 
         micro_bs = min(int(self.condition_policy_cfg.get("micro_batch_size", 32)), n)
+        reinforce_epochs = max(
+            1, int(self.condition_policy_cfg.get("reinforce_epochs", 2))
+        )
+        grad_clip = self.condition_policy_cfg.get("grad_clip", None)
+
         total_pg = torch.zeros(1, device=device)
         total_lp = torch.zeros(1, device=device)
-        n_mb = 0
+        total_ent = torch.zeros(1, device=device)
+        n_steps = 0
 
-        for start in range(0, n, micro_bs):
-            end = min(start + micro_bs, n)
-            mb_img = images_list[start:end]
-            mb_instr = instructions[start:end]
-            mb_idx = pred_cluster_stored[start:end]
-            mb_res = residual_sample[start:end]
-            mb_adv = adv[start:end]
+        for _ in range(reinforce_epochs):
+            for start in range(0, n, micro_bs):
+                end = min(start + micro_bs, n)
+                mb_img = images_list[start:end]
+                mb_instr = instructions[start:end]
+                mb_idx = pred_cluster_stored[start:end]
+                mb_res = residual_sample[start:end]
+                mb_adv = adv[start:end]
 
-            with torch.autocast(
-                device_type="cuda",
-                enabled=device.type == "cuda",
-                dtype=torch.bfloat16,
-            ):
-                out_lp = self.siglip_condition_model.evaluate_log_prob(
-                    images=mb_img,
-                    instructions=mb_instr,
-                    pred_cluster_idx=mb_idx,
-                    residual_sample=mb_res,
-                    cluster_sample_temperature=temp,
-                    reinforce_logprob="cluster",
-                )
-                logp = out_lp["log_prob_cluster"]
-                pg = -(mb_adv * logp).mean()
-                loss_mb = pg
+                self.siglip_condition_reinforce_optimizer.zero_grad(set_to_none=True)
 
-            loss_mb.backward()
-            total_pg += pg.detach()
-            total_lp += logp.detach().mean()
-            n_mb += 1
+                with torch.autocast(
+                    device_type="cuda",
+                    enabled=device.type == "cuda",
+                    dtype=torch.bfloat16,
+                ):
+                    out_lp = self.siglip_condition_model.evaluate_log_prob(
+                        images=mb_img,
+                        instructions=mb_instr,
+                        pred_cluster_idx=mb_idx,
+                        residual_sample=mb_res,
+                        cluster_sample_temperature=temp,
+                        reinforce_logprob="cluster",
+                    )
+                    logp = out_lp["log_prob_cluster"]
+                    pg = -(mb_adv * logp).mean()
+                    cluster_ent = out_lp["cluster_entropy"]
+                    if ent_coef != 0.0:
+                        loss_mb = pg - ent_coef * cluster_ent.mean()
+                    else:
+                        loss_mb = pg
 
-        if dist.is_initialized() and self._world_size > 1:
-            for p in self._siglip_reinforce_trainable_params:
-                if p.grad is not None:
-                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                loss_mb.backward()
 
-        grad_clip = self.condition_policy_cfg.get("grad_clip", None)
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self._siglip_reinforce_trainable_params, float(grad_clip)
-            )
+                if dist.is_initialized() and self._world_size > 1:
+                    for p in self._siglip_reinforce_trainable_params:
+                        if p.grad is not None:
+                            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
-        self.siglip_condition_reinforce_optimizer.step()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self._siglip_reinforce_trainable_params, float(grad_clip)
+                    )
 
-        denom = max(n_mb, 1)
+                self.siglip_condition_reinforce_optimizer.step()
+
+                total_pg += pg.detach()
+                total_lp += logp.detach().mean()
+                total_ent += cluster_ent.detach().float().mean()
+                n_steps += 1
+
+        denom = max(n_steps, 1)
         metrics = {
             "cond/policy_loss": float((total_pg / denom).item()),
             "cond/log_prob_cluster_mean": float((total_lp / denom).item()),
-            "cond/reward_mean": float(rewards.mean().item()),
-            "cond/baseline": float(self._cond_baseline.item()),
+            "cond/reward_mean": float(mean_r.item()),
+            "cond/baseline": float(mean_r.item()),
+            "cond/reward_std": float(std_r.item()),
+            "cond/cluster_entropy_mean": float((total_ent / denom).item()),
         }
         if dist.is_initialized() and self._world_size > 1:
             t = torch.tensor(
@@ -1256,6 +1380,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     metrics["cond/log_prob_cluster_mean"],
                     metrics["cond/reward_mean"],
                     metrics["cond/baseline"],
+                    metrics["cond/reward_std"],
+                    metrics["cond/cluster_entropy_mean"],
                 ],
                 device=device,
                 dtype=torch.float32,
@@ -1266,7 +1392,33 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "cond/log_prob_cluster_mean": t[1].item(),
                 "cond/reward_mean": t[2].item(),
                 "cond/baseline": t[3].item(),
+                "cond/reward_std": t[4].item(),
+                "cond/cluster_entropy_mean": t[5].item(),
             }
+            del t
+
+        self.siglip_condition_reinforce_optimizer.zero_grad(set_to_none=True)
+        del (
+            rewards_dev,
+            adv,
+            pred_cluster_stored,
+            residual_sample,
+            images_list,
+            instructions,
+            task_ids,
+            residual,
+            rewards,
+            images_u8,
+            pred_cluster_idx_all,
+            mean_r,
+            std_r,
+            total_pg,
+            total_lp,
+            total_ent,
+        )
+        if device.type == "cuda":
+            clear_memory(sync=True)
+
         return metrics
 
     def run_training(self) -> None:
@@ -1300,16 +1452,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.rollout_batch, shuffle_id
             )
 
+        vla_mb = self._vla_micro_batch_effective()
         assert (
-            self.cfg.actor.global_batch_size
-            % (self.cfg.actor.micro_batch_size * self._world_size)
-            == 0
-        ), "global_batch_size is not divisible by micro_batch_size * world_size"
+            self.cfg.actor.global_batch_size % (vla_mb * self._world_size) == 0
+        ), "global_batch_size is not divisible by effective micro_batch_size * world_size"
 
         self.gradient_accumulation = (
-            self.cfg.actor.global_batch_size
-            // self.cfg.actor.micro_batch_size
-            // self._world_size
+            self.cfg.actor.global_batch_size // vla_mb // self._world_size
         )
 
         # Split to make minibatch iterator for updating the actor
@@ -1334,13 +1483,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     == self.cfg.actor.global_batch_size
                     // torch.distributed.get_world_size()
                 )
-                assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
-                    f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
+                assert train_global_batch_size % vla_mb == 0, (
+                    f"{train_global_batch_size=}, {vla_mb=}"
                 )
 
                 train_micro_batch = get_iterator_k_split(
                     train_global_batch,
-                    train_global_batch_size // self.cfg.actor.micro_batch_size,
+                    train_global_batch_size // vla_mb,
                 )
 
                 self.optimizer.zero_grad()
@@ -1373,8 +1522,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         in (SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT)
                     )
                     if _cm_grpo_this_mb:
+                        mb = int(data["prev_logprobs"].shape[0])
                         z_grpo = self._build_grpo_z_for_microbatch(data)
-                        data_for_model = {**data, "z_ids": z_grpo}
+                        z_roll = data["z_ids"][:mb]
+                        cra = data.get("cond_residual_applied")
+                        if (
+                            cra is not None
+                            and isinstance(z_roll, torch.Tensor)
+                            and z_roll.dim() == 2
+                        ):
+                            m = cra.reshape(-1)[:mb].to(
+                                device=z_grpo.device, dtype=z_grpo.dtype
+                            )
+                            m = m.unsqueeze(1)
+                            z_roll_d = z_roll.to(
+                                device=z_grpo.device, dtype=z_grpo.dtype
+                            ).detach()
+                            z_mix = z_grpo * m + z_roll_d * (1.0 - m)
+                            data_for_model = {**data, "z_ids": z_mix}
+                        else:
+                            data_for_model = {**data, "z_ids": z_grpo}
 
                     if SupportedModel(self.cfg.actor.model.model_type) in [
                         SupportedModel.OPENVLA,
@@ -1388,6 +1555,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     compute_values = (
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
+                    
 
                     with self.amp_context:
                         output_dict = self.model(
