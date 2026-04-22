@@ -46,6 +46,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         num_action_chunks,
         add_value_head,
         max_prompt_length,
+        z_embedding_suite: str = "libero_object",
     ) -> None:
         super().__init__(config)
 
@@ -76,13 +77,11 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             )
 
         self.max_prompt_length = max_prompt_length
-
-        self.intruction_to_z_map = torch.load(
-            "libero_object_per_instruction_centers.pt"
-        )
-        self.instruction_to_task_id_map = torch.load(
-            "libero_object_instruction_to_task_id_map.pt"
-        )
+        self.z_embedding_suite = str(z_embedding_suite)
+        centers_path = f"{self.z_embedding_suite}_per_instruction_centers.pt"
+        task_map_path = f"{self.z_embedding_suite}_instruction_to_task_id_map.pt"
+        self.intruction_to_z_map = torch.load(centers_path)
+        self.instruction_to_task_id_map = torch.load(task_map_path)
         self.task_id_to_instruction_map = {
             int(v): k for k, v in self.instruction_to_task_id_map.items()
         }

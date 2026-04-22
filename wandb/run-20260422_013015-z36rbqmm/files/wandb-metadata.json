@@ -1,0 +1,67 @@
+{
+  "os":  "Linux-4.18.0-425.3.1.el8.x86_64-x86_64-with-glibc2.35",
+  "python":  "CPython 3.12.4",
+  "startedAt":  "2026-04-22T01:30:15.141908Z",
+  "args":  [
+    "--entity",
+    "kongyilun333",
+    "--project",
+    "rlinf"
+  ],
+  "program":  "/data/users/kongyilun/code/rlinf-condition/upload_wandb_export_csv.py",
+  "codePath":  "upload_wandb_export_csv.py",
+  "codePathLocal":  "upload_wandb_export_csv.py",
+  "git":  {
+    "remote":  "git@github.com:KongYilun/RLinf.git",
+    "commit":  "d60c388c2677e27214359e1991a0badd5611467f"
+  },
+  "email":  "kongyilun333@gmail.com",
+  "root":  "/data/users/kongyilun/code/rlinf-condition",
+  "host":  "app-793d2c8b88234351b2211c021cf09f3c-6884d4f48f-fx4r6",
+  "executable":  "/data/anaconda3/bin/python",
+  "cpu_count":  64,
+  "cpu_count_logical":  128,
+  "gpu":  "NVIDIA A800-SXM4-80GB",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "1288490188800",
+      "used":  "11967082496"
+    }
+  },
+  "memory":  {
+    "total":  "1081557000192"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA A800-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-9ae0e4ea-72ff-3248-c8d7-efcd4e527dcb"
+    },
+    {
+      "name":  "NVIDIA A800-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-723ab0ca-7cdf-5a7c-221e-c83cc56720c9"
+    },
+    {
+      "name":  "NVIDIA A800-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-2f30190c-10d8-30ce-91f6-eb94edb12591"
+    },
+    {
+      "name":  "NVIDIA A800-SXM4-80GB",
+      "memoryTotal":  "85899345920",
+      "cudaCores":  6912,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-07a5d2df-494c-404c-31cf-ac371ab7adec"
+    }
+  ],
+  "cudaVersion":  "12.4",
+  "writerId":  "8xgcoz7sl69wlwt1dhytradp24snmesk"
+}

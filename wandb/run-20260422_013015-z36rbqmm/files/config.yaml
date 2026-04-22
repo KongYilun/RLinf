@@ -1,0 +1,79 @@
+_wandb:
+    value:
+        cli_version: 0.21.4
+        e:
+            8xgcoz7sl69wlwt1dhytradp24snmesk:
+                args:
+                    - --entity
+                    - kongyilun333
+                    - --project
+                    - rlinf
+                codePath: upload_wandb_export_csv.py
+                codePathLocal: upload_wandb_export_csv.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "12.4"
+                disk:
+                    /:
+                        total: "1288490188800"
+                        used: "11967082496"
+                email: kongyilun333@gmail.com
+                executable: /data/anaconda3/bin/python
+                git:
+                    commit: d60c388c2677e27214359e1991a0badd5611467f
+                    remote: git@github.com:KongYilun/RLinf.git
+                gpu: NVIDIA A800-SXM4-80GB
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-9ae0e4ea-72ff-3248-c8d7-efcd4e527dcb
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-723ab0ca-7cdf-5a7c-221e-c83cc56720c9
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-2f30190c-10d8-30ce-91f6-eb94edb12591
+                    - architecture: Ampere
+                      cudaCores: 6912
+                      memoryTotal: "85899345920"
+                      name: NVIDIA A800-SXM4-80GB
+                      uuid: GPU-07a5d2df-494c-404c-31cf-ac371ab7adec
+                host: app-793d2c8b88234351b2211c021cf09f3c-6884d4f48f-fx4r6
+                memory:
+                    total: "1081557000192"
+                os: Linux-4.18.0-425.3.1.el8.x86_64-x86_64-with-glibc2.35
+                program: /data/users/kongyilun/code/rlinf-condition/upload_wandb_export_csv.py
+                python: CPython 3.12.4
+                root: /data/users/kongyilun/code/rlinf-condition
+                startedAt: "2026-04-22T01:30:15.141908Z"
+                writerId: 8xgcoz7sl69wlwt1dhytradp24snmesk
+        m: []
+        python_version: 3.12.4
+        t:
+            "1":
+                - 105
+            "2":
+                - 105
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 61
+            "4": 3.12.4
+            "5": 0.21.4
+            "12": 0.21.4
+            "13": linux-x86_64
+csv_path:
+    value: /data/users/kongyilun/code/rlinf-condition/wandb_export_2026-04-22T00_27_54.719+08_00.csv
+import_source:
+    value: wandb_export_csv
+num_steps:
+    value: 102

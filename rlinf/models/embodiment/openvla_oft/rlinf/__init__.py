@@ -86,6 +86,8 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         for key, val in override_config_kwargs.items():
             setattr(actor_model_config, key, val)
 
+    z_embedding_suite = cfg.get("z_embedding_suite", "libero_object")
+
     model = OpenVLAOFTForRLActionPrediction.from_pretrained(
         pretrained_model_name_or_path=cfg.model_path,
         torch_dtype=torch_dtype,
@@ -96,6 +98,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         trust_remote_code=True,
         add_value_head=cfg.add_value_head,
         max_prompt_length=cfg.max_prompt_length,
+        z_embedding_suite=z_embedding_suite,
     )
 
     # oft add

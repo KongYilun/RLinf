@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Union
 from transformers import AutoModel
 from transformers import AutoProcessor
 import math
@@ -182,20 +182,28 @@ class SiglipConditionRLModel(SiglipConditionModel):
         self._condition_policy_sampling_seed: Optional[int] = None
 
     def init_condition_policy_sampling_generator(
-        self, device: torch.device, seed: int
+        self, device: Union[torch.device, int, str], seed: int
     ) -> None:
         """
         Use a dedicated ``torch.Generator`` for cluster / residual sampling in ``forward``.
-        Call after ``.to(device)`` on the **rollout** worker (sampling only happens there).
-        Actor paths ``forward_z_for_actor_grpo`` / ``evaluate_log_prob`` are deterministic;
-        no need to call this on the actor copy.
 
-        Per-rank seeds (e.g. ``base_seed + rollout_rank``) avoid identical samples across
-        distributed rollout ranks. Omit this call to use the global PyTorch RNG (legacy).
+        Call after ``.to(device)``. Per-rank seeds (e.g. ``base_seed + rank``) avoid
+        identical samples across distributed rollout ranks.
+
+        ``device`` may be a ``torch.device``, or a CUDA index ``int`` (as from
+        ``torch.cuda.current_device()``), or a device string.
+
+        Omit this call to keep using the global PyTorch RNG (legacy behavior).
         """
-        self._condition_policy_sampling_seed = int(seed)
-        if device.type == "cuda":
-            gen = torch.Generator(device=device)
+        self._condition_policy_sampling_seed = int(seed) #% (2**63)
+        if isinstance(device, torch.device):
+            dev = device
+        elif isinstance(device, int):
+            dev = torch.device("cuda", device)
+        else:
+            dev = torch.device(device)
+        if dev.type == "cuda":
+            gen = torch.Generator(device=dev)
         else:
             gen = torch.Generator()
         gen.manual_seed(self._condition_policy_sampling_seed)
@@ -292,7 +300,6 @@ class SiglipConditionRLModel(SiglipConditionModel):
             "residual_mean": residual_mean,
             "residual_embedding": residual_sample,
             "pred_cluster_idx": pred_idx,
-            "argmax_cluster_idx": logits_c.argmax(dim=-1),
             "log_prob_cluster": log_prob_cluster,
             "log_prob_residual": log_prob_residual,
             "log_prob_joint": log_prob_cluster + log_prob_residual,

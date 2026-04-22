@@ -1,6 +1,6 @@
 defaults:
-  - env/libero_object@env.train
-  - env/libero_object@env.eval
+  - env/libero_10@env.train
+  - env/libero_10@env.eval
   - model/openvla_oft@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
@@ -15,14 +15,14 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 1,2
+    actor,env,rollout: 2,3
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "debug"
+    experiment_name: "debug_10"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 2
@@ -33,31 +33,22 @@ runner:
   save_interval: 25
   # After each successful save, remove the previous checkpoint's actor/dcp_checkpoint (saves disk; old steps lose full FSDP resume).
   prune_previous_actor_dcp: true
-  # Do not delete DCP for these global_step values when they are the *previous* save (e.g. keep phase boundary at 50).
-  prune_previous_actor_dcp_keep_steps: [50]
+  # Never remove actor/dcp_checkpoint when that previous save was at these steps (e.g. [50] keeps global_step_50 after saving 75).
+  prune_previous_actor_dcp_keep_steps: []
 
-  resume_dir: null #"/data/users/kongyilun/code/rlinf-condition/logs/20260331-09:10:15-libero_object_grpo_openvlaoft_opt.yaml/libero_object_z_generator_sto_opt_512/checkpoints/global_step_25" # # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  resume_dir: null #"/data/users/kongyilun/code/rlinf-condition/logs/20260331-09:10:15-libero_10_grpo_openvlaoft_opt.yaml/libero_10_z_generator_sto_opt_512/checkpoints/global_step_25" # # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   use_optimizable_embedding: False
   # SigLIP 条件模型 rollout 时从 logits_c softmax 采样聚类；温度见 condition_model_sto.forward
-  # siglip_cluster_sample_temperature: 1.0
 
   # REINFORCE on SigLIP condition policy (requires use_optimizable_embedding=True).
   # When enable_rl is false, behavior matches pre–condition-policy-RL runs.
   condition_policy:
     enable_rl: False
-    # When cluster_only_schedule_end_step is set, z uses center-only on runner steps in [start,end]; static cluster_only below is ignored for that schedule.
     cluster_only: True
-    cluster_only_schedule_start_step: 0 # e.g. 0
-    cluster_only_schedule_end_step: 49 # e.g. 49; null = no schedule (use cluster_only only)
-    residual_when_sample_matches_argmax_only: True # phase 2: residual in z only if sample == argmax(logits_c)
-    reinforce_disable_from_runner_step: null # e.g. 50 to disable REINFORCE from phase 2 onward
-    checkpoint_path: "step3_encoder_training/siglip_condition_model_sto_0.pt" # default: step3_encoder_training/siglip_condition_model_sto.pt
-    # Reproducible sampling in forward(): null = use global torch RNG; int = dedicated Generator (e.g. match actor.seed).
-    sampling_seed: null
-    sampling_seed_add_rollout_rank: true
+    checkpoint_path: null # default: step3_encoder_training/siglip_condition_model_sto.pt
     cluster_sample_temperature: 2.0 # falls back to siglip_cluster_sample_temperature if omitted
     deterministic_cluster_train: false
     deterministic_residual_train: true
@@ -65,7 +56,7 @@ algorithm:
     deterministic_residual_eval: true
     # REINFORCE: log_prob_cluster only; optimizer over siglip + classifier_head (lr below).
     baseline_momentum: 0.95
-    update_interval_vla_steps: 1
+    update_interval_vla_steps: 5
     lr: 1.0e-6 # REINFORCE (siglip + classifier_head)
     weight_decay: 0.01
     grad_clip: 1.0
@@ -77,6 +68,12 @@ algorithm:
     reinforce_per_task_adv_standardize: true # if per_task: false => R - mean_task only
     # Cluster entropy bonus: minimize loss_pg - coef * mean(H(pi(.|s))).
     cluster_entropy_coef: 0.1
+    # Rollout only: reproducible cluster/residual sampling in condition policy ``forward``.
+    # Actor REINFORCE uses ``evaluate_log_prob`` (fixed rollout actions) — no policy resampling.
+    sampling_seed: ${actor.seed}
+    sampling_seed_add_rollout_rank: true
+    # Optional: during REINFORCE, model.train() enables Dropout — fork RNG for reproducible masks.
+    reinforce_train_seed: ${actor.seed}
     # GRPO backprop into cluster_embed + residual_head (separate optimizer), each train step.
     grpo_cm_start_step: 100
     grpo_cm_end_step: null # inclusive; null = no upper bound
@@ -88,7 +85,7 @@ algorithm:
   normalize_advantages: True
   kl_penalty: kl  # how to estimate kl divergence: kl or kl_penalty
   group_size: 2
-  rollout_epoch: 1
+  rollout_epoch: 2
   eval_rollout_epoch: 1 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: action_level  # action_level or chunk_level
@@ -134,7 +131,7 @@ env:
   group_name: "EnvGroup"
   enable_offload: False
 
-  # Override the default values in env/libero_object
+  # Override the default values in env/libero_10
   train:
     total_num_envs: 4
     group_size: ${algorithm.group_size}
@@ -165,25 +162,22 @@ rollout:
   
 
   model:
-    model_path: "/data/users/kongyilun/code/RLinf/step2_warmup/openvla-oft-conditioned/runs/libero_condition_z_10--30000_chkpt"
+    model_path: "/data/users/kongyilun/code/RLinf/step2_warmup/openvla-oft-conditioned/runs/libero_10_condition_z_10--150000_chkpt"
     precision: ${actor.model.precision}
 
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   micro_batch_size: 2
-  # From this runner step onward, VLA actor uses micro_batch_size//2 (rollout/env unchanged); must be even.
-  half_micro_batch_enable: True
-  half_micro_batch_from_runner_step: 50 # e.g. 50
   global_batch_size: 4
   seed: 1234
   enable_offload: True
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/data/users/kongyilun/code/RLinf/step2_warmup/openvla-oft-conditioned/runs/libero_condition_z_10--30000_chkpt"
+    model_path: "/data/users/kongyilun/code/RLinf/step2_warmup/openvla-oft-conditioned/runs/libero_10_condition_z_10--150000_chkpt"
     model_type: "openvla_oft"
-    unnorm_key: libero_object_no_noops
+    unnorm_key: libero_10_no_noops
     max_prompt_length: 128
 
   optim:

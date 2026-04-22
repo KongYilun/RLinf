@@ -26,6 +26,10 @@ from rlinf.models import get_model
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import put_tensor_device
+from rlinf.utils.z_embedding_paths import (
+    default_siglip_condition_checkpoint_path,
+    resolve_z_embedding_suite,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.rollout.hf.utils import init_real_obs
 from step3_encoder_training.condition_model_sto_new import SiglipConditionRLModel
@@ -54,7 +58,6 @@ class MultiStepRolloutWorker(Worker):
 
         self.actor_group_name = cfg.actor.group_name
         self.device = torch.cuda.current_device()
-        self._rollout_runner_step = 0
 
         self.num_pipeline_stages = cfg.rollout.pipeline_stage_num
         self.enable_offload = self.cfg.rollout.get("enable_offload", False)
@@ -69,6 +72,9 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
+            rollout_model_config.z_embedding_suite = resolve_z_embedding_suite(
+                self.cfg
+            )
 
         self.hf_model = get_model(rollout_model_config)
 
@@ -90,18 +96,6 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.offload_model()
 
-    def _maybe_init_condition_policy_sampling_generator(
-        self, model: SiglipConditionRLModel
-    ) -> None:
-        raw = self.condition_policy_cfg.get("sampling_seed", None)
-        if raw is None:
-            return
-        base = int(raw)
-        if bool(self.condition_policy_cfg.get("sampling_seed_add_rollout_rank", True)):
-            base += int(self._rank)
-        dev = next(model.parameters()).device
-        model.init_condition_policy_sampling_generator(dev, base)
-
     def _init_condition_model_and_centers(self):
         """
         Load SigLIP-based condition model and per-instruction cluster centers.
@@ -113,10 +107,11 @@ class MultiStepRolloutWorker(Worker):
         device = self.device
         device_str = f"cuda:{device}" if isinstance(device, int) else device
 
+        default_ckpt = default_siglip_condition_checkpoint_path(self.cfg)
         ckpt_path = (
             self.condition_policy_cfg.get("eval_checkpoint_path")
             or self.condition_policy_cfg.get("checkpoint_path", None)
-        ) or "step3_encoder_training/siglip_condition_model_sto.pt"
+        ) or default_ckpt
         ckpt = torch.load(ckpt_path, map_location=device_str)
         # from ray.util import pdb; pdb.set_trace()
         def _meta_from_ckpt(c):
@@ -137,7 +132,7 @@ class MultiStepRolloutWorker(Worker):
                 state_dict = ckpt.get("model_state_dict", ckpt)
         elif isinstance(ckpt.get("model"), dict):
             meta_path = self.condition_policy_cfg.get("checkpoint_path", None) or (
-                "step3_encoder_training/siglip_condition_model_sto.pt"
+                default_ckpt
             )
             meta = torch.load(meta_path, map_location="cpu")
             num_classes, residual_dim, siglip_model_path, center_embed_dim = _meta_from_ckpt(
@@ -163,14 +158,34 @@ class MultiStepRolloutWorker(Worker):
         # if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         #     model.to(dtype=torch.bfloat16)
         model.eval()
-        self._maybe_init_condition_policy_sampling_generator(model)
         self.siglip_condition_model = model
 
         # per-instruction cluster centers: instruction -> [num_clusters, D]
-        centers_path = "libero_object_per_instruction_centers.pt"
+        suite = resolve_z_embedding_suite(self.cfg)
+        centers_path = f"{suite}_per_instruction_centers.pt"
         instruction_centers = torch.load(centers_path, map_location="cpu")
         # keep tensors on CPU; move slices to CUDA on demand
         self.instruction_centers = instruction_centers
+
+        self._apply_condition_policy_sampling_generator()
+
+    def _apply_condition_policy_sampling_generator(self) -> None:
+        """Bind a dedicated RNG to condition-policy sampling after the model is on ``self.device``."""
+        if self.siglip_condition_model is None:
+            return
+        raw = self.condition_policy_cfg.get("sampling_seed", None)
+        # from ray.util import pdb; pdb.set_trace()
+        if raw is None:
+            return
+        try:
+            s = int(raw)
+        except (TypeError, ValueError):
+            return
+        if self.condition_policy_cfg.get("sampling_seed_add_rollout_rank", False):
+            s += int(self._rank)
+        self.siglip_condition_model.init_condition_policy_sampling_generator(
+            self.device, s
+        )
 
     def _obs_image_hwc_uint8_numpy(self, img: torch.Tensor):
         img = img.detach().cpu()
@@ -189,49 +204,6 @@ class MultiStepRolloutWorker(Worker):
         elif img_hwc.dtype != torch.uint8:
             img_hwc = img_hwc.to(torch.uint8)
         return img_hwc.numpy()
-
-    def _condition_policy_runner_step(self) -> int:
-        return int(getattr(self, "_rollout_runner_step", 0))
-
-    def _effective_cluster_only(self) -> bool:
-        """Schedule overrides static ``cluster_only`` when ``cluster_only_schedule_end_step`` is set."""
-        cp = self.condition_policy_cfg
-        end = cp.get("cluster_only_schedule_end_step", None)
-        if end is None:
-            return bool(cp.get("cluster_only", False))
-        start = int(cp.get("cluster_only_schedule_start_step", 0))
-        g = self._condition_policy_runner_step()
-        return int(start) <= g <= int(end)
-
-    def _residual_when_sample_matches_argmax_only(self) -> bool:
-        return bool(
-            self.condition_policy_cfg.get(
-                "residual_when_sample_matches_argmax_only", False
-            )
-        )
-
-    def _z_from_siglip_row(
-        self,
-        instr: str,
-        pred_idx: int,
-        argmax_idx: int,
-        residual_1d: torch.Tensor,
-    ) -> tuple[torch.Tensor, float]:
-        """
-        Geometric z for VLA: center from file [+ residual].
-        Returns (z_vector, cond_residual_applied scalar 0.0 or 1.0 for GRPO gating).
-        """
-        centers_per_instr = self.instruction_centers[instr]
-        center_vec = centers_per_instr[int(pred_idx)].to(
-            residual_1d.device, dtype=residual_1d.dtype
-        )
-        if self._effective_cluster_only():
-            return center_vec, 0.0
-        if not self._residual_when_sample_matches_argmax_only():
-            return center_vec + residual_1d, 1.0
-        if int(pred_idx) == int(argmax_idx):
-            return center_vec + residual_1d, 1.0
-        return center_vec, 0.0
 
     def _instruction_strings_for_batch(self, task_desc, batch_size: int) -> list[str]:
         out: list[str] = []
@@ -293,17 +265,18 @@ class MultiStepRolloutWorker(Worker):
             )
         residual = siglip_outputs["residual_embedding"]
         pred_idx = siglip_outputs["pred_cluster_idx"]
-        argmax_idx = siglip_outputs.get("argmax_cluster_idx")
-        if argmax_idx is None:
-            argmax_idx = siglip_outputs["logits_c"].argmax(dim=-1)
         z_rows = []
         for i in range(bsz):
-            z_i, _ = self._z_from_siglip_row(
-                instructions[i],
-                int(pred_idx[i].item()),
-                int(argmax_idx[i].item()),
-                residual[i],
+            instr = instructions[i]
+            cid = int(pred_idx[i].item())
+            centers_per_instr = self.instruction_centers[instr]
+            center_vec = centers_per_instr[cid].to(
+                residual.device, dtype=residual.dtype
             )
+            if self.condition_policy_cfg.get("cluster_only", False):
+                z_i = center_vec
+            else:
+                z_i = center_vec + residual[i]
             z_rows.append(z_i)
         return torch.stack(z_rows, dim=0).to(self.device)
 
@@ -534,20 +507,6 @@ class MultiStepRolloutWorker(Worker):
                                 imgs = imgs[:, 0]
                             B = imgs.shape[0]
 
-                            # detect whether all initial states in this GRPO group share
-                            # the same first-frame image
-                            # flat = imgs.reshape(B, -1)
-                            # same_mask = torch.all(
-                            #     flat == flat[0:1], dim=1
-                            # ).detach().cpu()
-                            # if not bool(same_mask.all()):
-                            #     # only print once per group to avoid log spam
-                            #     print(
-                            #         "[MultiStepRolloutWorker] Warning: initial states in "
-                            #         "a GRPO group are not identical when using "
-                            #         "optimizable embeddings."
-                            #     )
-
                             # build SigLIP inputs from the first env in the group
                             img0 = imgs[0].detach().cpu()
                             if img0.ndim != 3:
@@ -621,13 +580,16 @@ class MultiStepRolloutWorker(Worker):
                             cluster_id = int(
                                 siglip_outputs["pred_cluster_idx"][0].item()
                             )
-                            # print(cluster_id)
-                            argmax_c = int(
-                                siglip_outputs["argmax_cluster_idx"][0].item()
+                            # from ray.util import pdb; pdb.set_trace()
+                            centers_per_instr = self.instruction_centers[instr0]
+                            center_vec = centers_per_instr[cluster_id].to(
+                                residual.device, dtype=residual.dtype
                             )
-                            z_vec, ra = self._z_from_siglip_row(
-                                instr0, cluster_id, argmax_c, residual
-                            )
+                            if self.condition_policy_cfg.get("cluster_only", False):
+                                z_vec = center_vec
+                            else:
+                                z_vec = center_vec + residual
+                            # z_vec = center_vec #+ residual
                             # broadcast same z-embedding to all envs in the group
                             z_batch = z_vec.unsqueeze(0).expand(B, -1).contiguous()
                             # from ray.util import pdb; pdb.set_trace()
@@ -637,7 +599,6 @@ class MultiStepRolloutWorker(Worker):
                                     "siglip_outputs": siglip_outputs,
                                     "img0_hwc": img0_hwc,
                                     "B": B,
-                                    "cond_residual_applied": float(ra),
                                 }
 
                         z_ids = group_latents[stage_id]
@@ -685,8 +646,6 @@ class MultiStepRolloutWorker(Worker):
                             .detach()
                             .cpu()
                         )
-                        ra = float(cond_meta.get("cond_residual_applied", 1.0))
-                        cra = torch.full((Bm,), ra, dtype=torch.float32)
                         cond_kwargs = {
                             "cond_log_prob_cluster": lp_c,
                             "cond_log_prob_residual": lp_r,
@@ -694,7 +653,6 @@ class MultiStepRolloutWorker(Worker):
                             "cond_residual": res_b,
                             "cond_initial_image_hwc": img_b,
                             "cond_pred_cluster_idx": pc,
-                            "cond_residual_applied": cra,
                         }
 
                     chunk_step_result = ChunkStepResult(
@@ -828,6 +786,7 @@ class MultiStepRolloutWorker(Worker):
         self.hf_model = self.hf_model.to(self.device)
         if self.use_optimizable_embedding and self.siglip_condition_model is not None:
             self.siglip_condition_model.to(self.device)
+            self._apply_condition_policy_sampling_generator()
 
     async def recv_env_output(
         self, input_channel: Channel, mode="train"
@@ -859,6 +818,5 @@ class MultiStepRolloutWorker(Worker):
         return split_num
 
     def set_global_step(self, global_step):
-        self._rollout_runner_step = int(global_step)
         if hasattr(self.hf_model, "set_global_step"):
             self.hf_model.set_global_step(global_step)

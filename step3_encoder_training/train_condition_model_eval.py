@@ -145,7 +145,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- 1. 加载聚类监督 ---
-    clusters_path = ROOT_DIR / "step1_embedding" / "libero_object_per_instruction_clusters_proj_all.pt"
+    clusters_path = ROOT_DIR / "step1_embedding" / "libero_10_per_instruction_clusters_proj_all.pt"
     clusters = torch.load(clusters_path, map_location="cpu")
 
     labels: torch.Tensor = clusters["labels"]  # [N]
@@ -167,8 +167,8 @@ def main() -> None:
 
     # --- 2. 从 RLDS 数据集中抽取 (instruction, 第一帧图像) ---
     dataset_root = ROOT_DIR / "dataset"
-    dataset_name = "libero_object_no_noops100"
-    eval_dataset_name = "libero_object_no_noops"
+    dataset_name = "libero_10_no_noops"
+    eval_dataset_name = "libero_10_no_noops"
 
     siglip_model_path = "/data/users/kongyilun/models/siglip-so400m-patch14-384"
     samples = build_rlds_first_frame_samples(
@@ -195,7 +195,7 @@ def main() -> None:
 
     batch_size = 16
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    # 评测：全量 libero_object_no_noops，顺序固定
+    # 评测：全量 libero_10_no_noops，顺序固定
     eval_dataloader = DataLoader(
         eval_dataset, batch_size=batch_size, shuffle=False, num_workers=4
     )
@@ -232,7 +232,7 @@ def main() -> None:
         model.parameters(), lr=initial_lr, weight_decay=1e-2
     )
 
-    num_epochs = 200
+    num_epochs = 100
     steps_per_epoch = len(dataloader)
     print(f"steps_per_epoch: {steps_per_epoch}")
     total_optimizer_steps = max(1, num_epochs * steps_per_epoch)
@@ -298,7 +298,7 @@ def main() -> None:
 
             residual_l2 = (residual_pred.pow(2).sum(dim=1).mean())
 
-            loss = cls_loss + reg_loss + residual_l2_weight * residual_l2
+            loss = cls_loss 
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -328,7 +328,7 @@ def main() -> None:
             )
 
     # 可选：保存训练好的权重
-    out_path = ROOT_DIR / "step3_encoder_training" / "siglip_condition_model_sto_0.pt"
+    out_path = ROOT_DIR / "step3_encoder_training" / "libero_10_siglip_condition_model_new.pt"
     torch.save(
         {
             "model_state_dict": model.state_dict(),

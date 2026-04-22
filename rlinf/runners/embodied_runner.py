@@ -255,13 +255,11 @@ class EmbodiedRunner:
             prev = self._last_saved_step
             if prev is not None and prev != self.global_step:
                 keep_raw = self.cfg.runner.get(
-                    "prune_previous_actor_dcp_keep_steps", [50]
+                    "prune_previous_actor_dcp_keep_steps", None
                 )
-                keep_steps = (
-                    {int(x) for x in keep_raw}
-                    if keep_raw is not None
-                    else set()
-                )
+                keep_prev_dcp: set[int] = set()
+                if keep_raw is not None:
+                    keep_prev_dcp = {int(x) for x in list(keep_raw)}
                 checkpoints_root = os.path.join(
                     self.cfg.runner.logger.log_path,
                     self.cfg.runner.logger.experiment_name,
@@ -273,10 +271,10 @@ class EmbodiedRunner:
                     "actor",
                     "dcp_checkpoint",
                 )
-                if prev in keep_steps:
+                if prev in keep_prev_dcp:
                     logger.info(
-                        "Skipping DCP prune for protected checkpoint global_step_%s",
-                        prev,
+                        "Skipping prune of previous actor DCP (retained step): %s",
+                        prev_dcp,
                     )
                 elif os.path.isdir(prev_dcp):
                     shutil.rmtree(prev_dcp)

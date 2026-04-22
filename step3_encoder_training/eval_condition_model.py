@@ -99,7 +99,7 @@ def evaluate_siglip_condition_model(
                 deterministic_cluster=True,
                 # cluster_ids_for_residual=None
             )
-            out_am = model(images=images, instructions=instructions, deterministic_cluster=False)
+            out_am = model(images=images, instructions=instructions, deterministic_cluster=True)
             # cluster_ids_for_residual=None
             
             logits = out_gt["logits_c"]
@@ -372,7 +372,7 @@ def main() -> None:
         center_embed_dim=center_embed_dim,
     )
     # import ipdb; ipdb.set_trace()
-    tmp=torch.load("/data/users/kongyilun/code/rlinf-condition/logs/20260406-16:12:22-libero_object_grpo_openvlaoft_opt.yaml/libero_object_z_generator_konly_refined_new/checkpoints/global_step_25/condition_policy.pt", map_location="cpu")
+    tmp=torch.load("/data/users/kongyilun/code/rlinf-condition/logs/20260406-16:12:22-libero_object_grpo_openvlaoft_opt.yaml/libero_object_z_generator_konly_refined_new/checkpoints/global_step_100/condition_policy.pt", map_location="cpu")
     model.load_state_dict(tmp['model'], strict=False)
     model.to(device)
 
